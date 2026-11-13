@@ -93,22 +93,31 @@ def haal_advertenties_op(url):
 
     resp = requests.get(basis_url, headers=HEADERS, timeout=10)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html_tekst = resp.text
 
+    # 1. Haal categorie-ID's (voor /l/ links) en zoekterm uit de paginabron
+    for cat_key in ("l1CategoryId", "l2CategoryId"):
+        m = re.search(rf'"{cat_key}"\s*:\s*(\d+)', html_tekst)
+        if m:
+            api_params[cat_key] = int(m.group(1))
+
+    soup = BeautifulSoup(html_tekst, "html.parser")
     next_data_tag = soup.find("script", id="__NEXT_DATA__")
+    fallback_listings = []
+
     if next_data_tag and next_data_tag.string:
         try:
             next_data = json.loads(next_data_tag.string)
-            search_req = (
-                next_data.get("props", {})
-                .get("pageProps", {})
-                .get("searchRequest", {})
-            )
-            for veld in ("query", "l1CategoryId", "l2CategoryId", "postcode", "distanceMeters"):
+            page_props = next_data.get("props", {}).get("pageProps", {})
+            search_req = page_props.get("searchRequest", {})
+            if search_req.get("query"):
+                api_params["query"] = search_req["query"]
+            for veld in ("postcode", "distanceMeters"):
                 if search_req.get(veld) is not None:
                     api_params[veld] = search_req[veld]
             for attr in search_req.get("attributesByKey", []):
                 attributes.append(attr)
+            fallback_listings = page_props.get("listingResponse", {}).get("listings", [])
         except Exception:
             pass
 
@@ -116,6 +125,7 @@ def haal_advertenties_op(url):
         q_deel = parsed.path.split("/q/", 1)[1].strip("/").split("/")[0]
         api_params["query"] = unquote(q_deel).replace("+", " ").replace("-", " ")
 
+    # 2. Verwerk eventuele filters uit het #-fragment
     for deel in parsed.fragment.split("|"):
         if ":" not in deel:
             continue
@@ -132,6 +142,7 @@ def haal_advertenties_op(url):
     if attributes:
         api_params["attributesByKey[]"] = list(dict.fromkeys(attributes))
 
+    # 3. Vraag gesorteerde JSON-resultaten op via de zoek-API
     api_headers = {**HEADERS, "Accept": "application/json", "Referer": basis_url}
     api_resp = requests.get(
         "https://www.marktplaats.nl/lrp/api/search",
@@ -140,7 +151,11 @@ def haal_advertenties_op(url):
         timeout=10,
     )
     api_resp.raise_for_status()
-    listings = api_resp.json().get("listings", [])
+
+    if api_resp.text.strip():
+        listings = api_resp.json().get("listings", [])
+    else:
+        listings = fallback_listings
 
     resultaten = []
     for item in listings:
