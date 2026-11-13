@@ -1,8 +1,9 @@
-name: Marktplaats Check
+name: Check Marktplaats
+
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
 
 permissions:
   contents: write
@@ -12,18 +13,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install requests beautifulsoup4
-      - name: Run script
+
+      - name: Installeer dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Controleer Marktplaats
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python marktplaats_notifier.py
-      - name: Opslaan
+
+      - name: Sla geziene advertenties op
         run: |
-          git config user.name "GitHub Action"
-          git config user.email "action@github.com"
-          git add geziene_advertenties.json zoekopdrachten.txt
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update" && git push)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add geziene_advertenties.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update geziene advertenties"
+            git pull --rebase
+            git push
+          fi
