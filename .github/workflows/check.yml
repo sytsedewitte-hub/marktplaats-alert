@@ -2,8 +2,10 @@ name: Check Marktplaats
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/15 * * * *'
+
+concurrency:
+  group: marktplaats-check
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -34,6 +36,6 @@ jobs:
           git add geziene_advertenties.json
           if ! git diff --cached --quiet; then
             git commit -m "Update geziene advertenties"
-            git pull --rebase
+            git pull --rebase --autostash -X ours
             git push
           fi
