@@ -17,21 +17,38 @@ HEADERS = {
     "Accept-Language": "nl-NL,nl;q=0.9",
 }
 
+telegram_bereikbaar = True
+
+
+def log(bericht):
+    print(bericht, flush=True)
+
 
 def stuur_telegram(tekst, parse_mode="HTML"):
+    global telegram_bereikbaar
+    if not telegram_bereikbaar:
+        return
+
     payload = {"chat_id": CHAT_ID, "text": tekst, "disable_web_page_preview": False}
     if parse_mode:
         payload["parse_mode"] = parse_mode
+
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json=payload,
-            timeout=30,
+            timeout=5,
         )
-        if not resp.ok and parse_mode:
+        if resp.status_code >= 500:
+            log(f"⚠️ Telegram serverfout ({resp.status_code}), overige meldingen worden overgeslagen.")
+            telegram_bereikbaar = False
+        elif resp.status_code == 400 and parse_mode:
             stuur_telegram(re.sub(r"<[^>]+>", "", tekst), parse_mode=None)
+        elif not resp.ok:
+            log(f"⚠️ Telegram melding geweigerd ({resp.status_code}): {resp.text}")
     except Exception as e:
-        print(f"Fout bij versturen Telegram-bericht: {e}")
+        log(f"⚠️ Telegram timeout/verbindingsfout: {e}")
+        telegram_bereikbaar = False
 
 
 def bedenk_naam(url):
@@ -74,8 +91,7 @@ def haal_advertenties_op(url):
     }
     attributes = []
 
-    # 1. Haal categorie- en zoekparameters uit __NEXT_DATA__ van de pagina
-    resp = requests.get(basis_url, headers=HEADERS, timeout=15)
+    resp = requests.get(basis_url, headers=HEADERS, timeout=10)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -96,12 +112,10 @@ def haal_advertenties_op(url):
         except Exception:
             pass
 
-    # Fallback voor /q/zoekterm/ als __NEXT_DATA__ geen query bevat
     if "query" not in api_params and "/q/" in parsed.path:
         q_deel = parsed.path.split("/q/", 1)[1].strip("/").split("/")[0]
         api_params["query"] = unquote(q_deel).replace("+", " ").replace("-", " ")
 
-    # 2. Verwerk eventuele filters uit het #-fragment (prijs, postcode, afstand, etc.)
     for deel in parsed.fragment.split("|"):
         if ":" not in deel:
             continue
@@ -118,13 +132,12 @@ def haal_advertenties_op(url):
     if attributes:
         api_params["attributesByKey[]"] = list(dict.fromkeys(attributes))
 
-    # 3. Vraag gesorteerde JSON-resultaten op via de Marktplaats zoek-API
     api_headers = {**HEADERS, "Accept": "application/json", "Referer": basis_url}
     api_resp = requests.get(
         "https://www.marktplaats.nl/lrp/api/search",
         params=api_params,
         headers=api_headers,
-        timeout=15,
+        timeout=10,
     )
     api_resp.raise_for_status()
     listings = api_resp.json().get("listings", [])
@@ -144,6 +157,8 @@ def haal_advertenties_op(url):
     return resultaten
 
 
+log("Start Marktplaats controle...")
+
 if os.path.exists(DB_FILE):
     with open(DB_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -156,6 +171,8 @@ else:
 with open(URLS_FILE, "r", encoding="utf-8") as f:
     regels = [r.strip() for r in f if r.strip() and not r.strip().startswith("#")]
 
+log(f"{len(regels)} zoekopdracht(en) gevonden.")
+
 for regel in regels:
     if "|" in regel:
         naam, url = [deel.strip() for deel in regel.split("|", 1)]
@@ -164,18 +181,22 @@ for regel in regels:
 
     is_nieuwe_url = url not in bekende_urls
     bekende_urls.add(url)
+    log(f"Controleren: {naam} (eerste keer: {is_nieuwe_url})")
 
     try:
         advertenties = haal_advertenties_op(url)
+        log(f" -> {len(advertenties)} advertenties opgehaald.")
     except Exception as e:
-        print(f"Fout bij ophalen van {naam}: {e}")
+        log(f" -> Fout bij ophalen van {naam}: {e}")
         continue
 
+    nieuwe_aantal = 0
     for ad in advertenties:
         if ad["id"] in geziene_ids:
             continue
 
         geziene_ids.add(ad["id"])
+        nieuwe_aantal += 1
 
         if not is_nieuwe_url:
             veilige_naam = html.escape(naam)
@@ -188,7 +209,10 @@ for regel in regels:
                 f"<a href=\"{ad['link']}\">Bekijk advertentie</a>"
             )
 
-    time.sleep(2)
+    log(f" -> {nieuwe_aantal} nieuwe ID's verwerkt.")
+    time.sleep(1)
 
 with open(DB_FILE, "w", encoding="utf-8") as f:
     json.dump({"urls": list(bekende_urls), "ids": list(geziene_ids)}, f)
+
+log("Klaar! Database opgeslagen.")
