@@ -79,22 +79,6 @@ def formatteer_prijs(price_info):
     return "Onbekend"
 
 
-def zoek_sleutel_recursief(data, doel_sleutel):
-    if isinstance(data, dict):
-        if doel_sleutel in data and data[doel_sleutel] is not None:
-            return data[doel_sleutel]
-        for v in data.values():
-            gevonden = zoek_sleutel_recursief(v, doel_sleutel)
-            if gevonden is not None:
-                return gevonden
-    elif isinstance(data, list):
-        for item in data:
-            gevonden = zoek_sleutel_recursief(item, doel_sleutel)
-            if gevonden is not None:
-                return gevonden
-    return None
-
-
 def haal_advertenties_op(url):
     parsed = urlparse(url)
     basis_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -119,45 +103,40 @@ def haal_advertenties_op(url):
     if next_data_tag and next_data_tag.string:
         try:
             next_data = json.loads(next_data_tag.string)
+            query_obj = next_data.get("query", {})
             page_props = next_data.get("props", {}).get("pageProps", {})
-            search_req = zoek_sleutel_recursief(page_props, "searchRequest") or {}
+            srar = page_props.get("searchRequestAndResponse", {})
+            search_req = srar.get("searchRequest", {})
+            cats = search_req.get("categories", {})
 
-            # 1. Zoek categoriesById (bijv. [1953, 2875]) in searchRequest of pageProps
-            cats_by_id = (
-                zoek_sleutel_recursief(search_req, "categoriesById")
-                or zoek_sleutel_recursief(page_props, "categoriesById")
+            # L1 categorie ophalen
+            l1_id = (
+                query_obj.get("l1CategoryId")
+                or (cats.get("l1Category") or {}).get("id")
             )
-            if isinstance(cats_by_id, list) and cats_by_id:
-                api_params["l1CategoryId"] = int(cats_by_id[0])
-                if len(cats_by_id) > 1:
-                    api_params["l2CategoryId"] = int(cats_by_id[1])
+            if l1_id:
+                api_params["l1CategoryId"] = int(str(l1_id).split(",")[0])
 
-            # 2. Zoek l1Category / l2Category objecten
-            for level, obj_key in (("l1CategoryId", "l1Category"), ("l2CategoryId", "l2Category")):
-                cat_obj = zoek_sleutel_recursief(page_props, obj_key)
-                if isinstance(cat_obj, dict) and cat_obj.get("id") and level not in api_params:
-                    api_params[level] = int(cat_obj["id"])
+            # L2 subcategorie ophalen (let op meervoud: l2CategoryIds / l2Categories)
+            l2_raw = query_obj.get("l2CategoryIds")
+            l2_list = cats.get("l2Categories") or []
+            if l2_raw:
+                api_params["l2CategoryId"] = int(str(l2_raw).split(",")[0])
+            elif l2_list and isinstance(l2_list[0], dict) and l2_list[0].get("id"):
+                api_params["l2CategoryId"] = int(l2_list[0]["id"])
 
-            # 3. Zoek directe l1CategoryId / l2CategoryId velden
-            for cat_key in ("l1CategoryId", "l2CategoryId"):
-                if cat_key not in api_params:
-                    val = (
-                        zoek_sleutel_recursief(search_req, cat_key)
-                        or zoek_sleutel_recursief(page_props, cat_key)
-                    )
-                    if val is not None:
-                        api_params[cat_key] = int(val)
+            if search_req.get("query"):
+                api_params["query"] = search_req["query"]
+            dist_obj = search_req.get("distance") or {}
+            if dist_obj.get("postcode"):
+                api_params["postcode"] = dist_obj["postcode"]
+            if dist_obj.get("distanceMeters") is not None:
+                api_params["distanceMeters"] = dist_obj["distanceMeters"]
 
-            if isinstance(search_req, dict):
-                if search_req.get("query"):
-                    api_params["query"] = search_req["query"]
-                for veld in ("postcode", "distanceMeters"):
-                    if search_req.get(veld) is not None:
-                        api_params[veld] = search_req[veld]
-                for attr in search_req.get("attributesByKey", []):
-                    attributes.append(attr)
+            for attr in search_req.get("attributesByKey", []):
+                attributes.append(attr)
 
-            fallback_listings = zoek_sleutel_recursief(page_props, "listings") or []
+            fallback_listings = srar.get("listings", [])
         except Exception as e:
             log(f"    [Debug] Fout bij uitlezen __NEXT_DATA__: {e}")
 
@@ -195,9 +174,6 @@ def haal_advertenties_op(url):
 
     api_listings = api_resp.json().get("listings", []) if api_resp.text.strip() else []
     listings = api_listings if api_listings else fallback_listings
-
-    if not listings:
-        log(f"    [Debug] Gebruikte parameters: {api_params}")
 
     resultaten = []
     for item in listings:
