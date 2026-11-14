@@ -91,6 +91,7 @@ def haal_advertenties_op(url):
         "viewOptions": "list-view",
     }
     attributes = []
+    l2_id = None
 
     resp = requests.get(basis_url, headers=HEADERS, timeout=10)
     resp.raise_for_status()
@@ -119,20 +120,22 @@ def haal_advertenties_op(url):
             l2_raw = query_obj.get("l2CategoryIds")
             l2_list = cats.get("l2Categories") or []
             if l2_raw:
-                api_params["l2CategoryId"] = int(str(l2_raw).split(",")[0])
+                l2_id = int(str(l2_raw).split(",")[0])
             elif l2_list and isinstance(l2_list[0], dict) and l2_list[0].get("id"):
-                api_params["l2CategoryId"] = int(l2_list[0]["id"])
+                l2_id = int(l2_list[0]["id"])
+
+            if l2_id:
+                api_params["l2CategoryId"] = l2_id
+                api_params["l2CategoryIds"] = str(l2_id)
 
             if search_req.get("query"):
                 api_params["query"] = search_req["query"]
-            dist_obj = search_req.get("distance") or {}
-            if dist_obj.get("postcode"):
-                api_params["postcode"] = dist_obj["postcode"]
-            if dist_obj.get("distanceMeters") is not None:
-                api_params["distanceMeters"] = dist_obj["distanceMeters"]
 
             for attr in search_req.get("attributesByKey", []):
-                attributes.append(attr)
+                if isinstance(attr, str):
+                    attributes.append(attr)
+                elif isinstance(attr, dict) and attr.get("attributeKey") and attr.get("attributeValueKey"):
+                    attributes.append(f"{attr['attributeKey']}:{attr['attributeValueKey']}")
 
             fallback_listings = srar.get("listings", [])
         except Exception as e:
@@ -155,8 +158,9 @@ def haal_advertenties_op(url):
         else:
             attributes.append(f"{k}:{v}")
 
-    if "postcode" in api_params and "distanceMeters" not in api_params:
-        api_params["distanceMeters"] = 100000
+    # Als er geen afstand in de URL staat (Heel NL), laat postcode dan ook weg
+    if "distanceMeters" not in api_params:
+        api_params.pop("postcode", None)
 
     if attributes:
         api_params["attributesByKey[]"] = list(dict.fromkeys(attributes))
@@ -175,12 +179,17 @@ def haal_advertenties_op(url):
 
     resultaten = []
     for item in listings:
-        ad_id = item.get("itemId")
+        ad_id = str(item.get("itemId") or "")
         vip_url = item.get("vipUrl")
-        if not ad_id or not vip_url:
+        # Sla commerciële Admarkt-advertenties ('a...') over
+        if not ad_id or not vip_url or ad_id.startswith("a"):
             continue
+        # Harde check: negeer advertenties uit andere subcategorieën als l2_id bekend is
+        if l2_id and item.get("categoryId") and int(item["categoryId"]) != l2_id:
+            continue
+
         resultaten.append({
-            "id": str(ad_id),
+            "id": ad_id,
             "titel": item.get("title") or "Nieuwe advertentie",
             "prijs": formatteer_prijs(item.get("priceInfo")),
             "link": urljoin("https://www.marktplaats.nl", vip_url.split("?")[0]),
@@ -193,9 +202,12 @@ log("Start Marktplaats controle...")
 db = {}
 if os.path.exists(DB_FILE):
     with open(DB_FILE, "r", encoding="utf-8") as f:
-        ruwe_data = json.load(f)
-        if isinstance(ruwe_data, dict) and "urls" not in ruwe_data:
-            db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
+        try:
+            ruwe_data = json.load(f)
+            if isinstance(ruwe_data, dict) and "urls" not in ruwe_data:
+                db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
+        except Exception:
+            db = {}
 
 with open(URLS_FILE, "r", encoding="utf-8") as f:
     regels = [r.strip() for r in f if r.strip() and not r.strip().startswith("#")]
