@@ -206,7 +206,7 @@ def haal_advertenties_op(url):
             "id": ad_id,
             "titel": item.get("title") or "Nieuwe advertentie",
             "prijs": formatteer_prijs(item.get("priceInfo")),
-            "datum": str(item.get("date") or ""),
+            "datum": str(item.get("date") or "").strip(),
             "link": urljoin("https://www.marktplaats.nl", vip_url.split("?")[0]),
         })
     return resultaten
@@ -260,8 +260,16 @@ for regel in regels:
         nieuwe_ids_aantal += 1
         ad_nummer = haal_id_nummer(ad["id"])
 
-        if not is_nieuwe_url and ad["datum"] == "Vandaag" and ad_nummer > hoogste_bekende_id:
+        if is_nieuwe_url:
+            continue
+
+        if ad["datum"].lower() != "vandaag":
+            log(f"    [Overgeslagen] {ad['id']} ({ad['titel'][:35]}...) -> datum is '{ad['datum']}' (niet Vandaag)")
+        elif ad_nummer <= hoogste_bekende_id:
+            log(f"    [Overgeslagen] {ad['id']} ({ad['titel'][:35]}...) -> ouder ID ({ad_nummer} <= {hoogste_bekende_id})")
+        else:
             gepusht_aantal += 1
+            log(f"    [Gepusht] {ad['id']} ({ad['titel'][:35]}...) -> nieuw!")
             veilige_naam = html.escape(naam)
             veilige_titel = html.escape(ad["titel"])
             veilige_prijs = html.escape(ad["prijs"])
