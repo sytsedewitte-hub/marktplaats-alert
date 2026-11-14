@@ -79,6 +79,22 @@ def formatteer_prijs(price_info):
     return "Onbekend"
 
 
+def zoek_sleutel_recursief(data, doel_sleutel):
+    if isinstance(data, dict):
+        if doel_sleutel in data and data[doel_sleutel] is not None:
+            return data[doel_sleutel]
+        for v in data.values():
+            gevonden = zoek_sleutel_recursief(v, doel_sleutel)
+            if gevonden is not None:
+                return gevonden
+    elif isinstance(data, list):
+        for item in data:
+            gevonden = zoek_sleutel_recursief(item, doel_sleutel)
+            if gevonden is not None:
+                return gevonden
+    return None
+
+
 def haal_advertenties_op(url):
     parsed = urlparse(url)
     basis_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -104,26 +120,46 @@ def haal_advertenties_op(url):
         try:
             next_data = json.loads(next_data_tag.string)
             page_props = next_data.get("props", {}).get("pageProps", {})
-            search_req = page_props.get("searchRequest", {})
-            cat_obj = page_props.get("category", {})
+            search_req = zoek_sleutel_recursief(page_props, "searchRequest") or {}
 
-            for bron in (search_req, page_props, cat_obj):
-                if not isinstance(bron, dict):
-                    continue
-                for cat_key in ("l1CategoryId", "l2CategoryId", "categoryId"):
-                    if bron.get(cat_key) is not None and cat_key not in api_params:
-                        api_params[cat_key] = int(bron[cat_key])
+            # 1. Zoek categoriesById (bijv. [1953, 2875]) in searchRequest of pageProps
+            cats_by_id = (
+                zoek_sleutel_recursief(search_req, "categoriesById")
+                or zoek_sleutel_recursief(page_props, "categoriesById")
+            )
+            if isinstance(cats_by_id, list) and cats_by_id:
+                api_params["l1CategoryId"] = int(cats_by_id[0])
+                if len(cats_by_id) > 1:
+                    api_params["l2CategoryId"] = int(cats_by_id[1])
 
-            if search_req.get("query"):
-                api_params["query"] = search_req["query"]
-            for veld in ("postcode", "distanceMeters"):
-                if search_req.get(veld) is not None:
-                    api_params[veld] = search_req[veld]
-            for attr in search_req.get("attributesByKey", []):
-                attributes.append(attr)
-            fallback_listings = page_props.get("listingResponse", {}).get("listings", [])
-        except Exception:
-            pass
+            # 2. Zoek l1Category / l2Category objecten
+            for level, obj_key in (("l1CategoryId", "l1Category"), ("l2CategoryId", "l2Category")):
+                cat_obj = zoek_sleutel_recursief(page_props, obj_key)
+                if isinstance(cat_obj, dict) and cat_obj.get("id") and level not in api_params:
+                    api_params[level] = int(cat_obj["id"])
+
+            # 3. Zoek directe l1CategoryId / l2CategoryId velden
+            for cat_key in ("l1CategoryId", "l2CategoryId"):
+                if cat_key not in api_params:
+                    val = (
+                        zoek_sleutel_recursief(search_req, cat_key)
+                        or zoek_sleutel_recursief(page_props, cat_key)
+                    )
+                    if val is not None:
+                        api_params[cat_key] = int(val)
+
+            if isinstance(search_req, dict):
+                if search_req.get("query"):
+                    api_params["query"] = search_req["query"]
+                for veld in ("postcode", "distanceMeters"):
+                    if search_req.get(veld) is not None:
+                        api_params[veld] = search_req[veld]
+                for attr in search_req.get("attributesByKey", []):
+                    attributes.append(attr)
+
+            fallback_listings = zoek_sleutel_recursief(page_props, "listings") or []
+        except Exception as e:
+            log(f"    [Debug] Fout bij uitlezen __NEXT_DATA__: {e}")
 
     if "query" not in api_params and "/q/" in parsed.path:
         q_deel = parsed.path.split("/q/", 1)[1].strip("/").split("/")[0]
@@ -159,6 +195,9 @@ def haal_advertenties_op(url):
 
     api_listings = api_resp.json().get("listings", []) if api_resp.text.strip() else []
     listings = api_listings if api_listings else fallback_listings
+
+    if not listings:
+        log(f"    [Debug] Gebruikte parameters: {api_params}")
 
     resultaten = []
     for item in listings:
