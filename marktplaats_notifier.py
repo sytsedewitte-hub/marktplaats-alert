@@ -192,7 +192,7 @@ with open(URLS_FILE, "r", encoding="utf-8") as f:
 log(f"{len(regels)} zoekopdracht(en) gevonden.")
 
 for regel in regels:
-  if "|" in regel and not regel.startswith("http"):
+    if "|" in regel and not regel.startswith("http"):
         naam, url = [deel.strip() for deel in regel.split("|", 1)]
     else:
         naam, url = bedenk_naam(regel), regel
