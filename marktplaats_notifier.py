@@ -65,18 +65,32 @@ def bedenk_naam(url):
 def formatteer_prijs(price_info):
     if not price_info:
         return "Onbekend"
-    ptype = price_info.get("priceType", "")
+
+    ptype = (price_info.get("priceType") or "").upper()
     cents = price_info.get("priceCents")
-    if ptype == "FREE":
-        return "Gratis"
-    if ptype == "SEE_DESCRIPTION":
-        return "Zie omschrijving"
-    if ptype == "BID":
-        return "Bieden"
-    if cents is not None:
+
+    vaste_labels = {
+        "EXCHANGE": "Ruilen",
+        "FAST_BID": "Bieden",
+        "FREE": "Gratis",
+        "FREE_BID": "Bieden",
+        "NOTK": "N.o.t.k.",
+        "NVT": "N.v.t.",
+        "ON_REQUEST": "Op aanvraag",
+        "RESERVED": "Gereserveerd",
+        "SEE_DESCRIPTION": "Zie omschrijving",
+    }
+    if ptype in vaste_labels:
+        return vaste_labels[ptype]
+
+    if cents is not None and cents > 0:
         bedrag = f"€ {cents / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"Bieden vanaf {bedrag}" if ptype == "MIN_BID" else bedrag
-    return "Onbekend"
+
+    if ptype == "MIN_BID":
+        return "Bieden"
+
+    return f"Onbekend ({ptype})" if ptype else "Onbekend"
 
 
 def haal_advertenties_op(url):
