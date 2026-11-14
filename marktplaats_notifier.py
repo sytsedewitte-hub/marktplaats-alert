@@ -109,7 +109,6 @@ def haal_advertenties_op(url):
             search_req = srar.get("searchRequest", {})
             cats = search_req.get("categories", {})
 
-            # L1 categorie ophalen
             l1_id = (
                 query_obj.get("l1CategoryId")
                 or (cats.get("l1Category") or {}).get("id")
@@ -117,7 +116,6 @@ def haal_advertenties_op(url):
             if l1_id:
                 api_params["l1CategoryId"] = int(str(l1_id).split(",")[0])
 
-            # L2 subcategorie ophalen (let op meervoud: l2CategoryIds / l2Categories)
             l2_raw = query_obj.get("l2CategoryIds")
             l2_list = cats.get("l2Categories") or []
             if l2_raw:
@@ -192,19 +190,19 @@ def haal_advertenties_op(url):
 
 log("Start Marktplaats controle...")
 
+db = {}
 if os.path.exists(DB_FILE):
     with open(DB_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        geziene_ids = set(data.get("ids", []))
-        bekende_urls = set(data.get("urls", []))
-else:
-    geziene_ids = set()
-    bekende_urls = set()
+        ruwe_data = json.load(f)
+        if isinstance(ruwe_data, dict) and "urls" not in ruwe_data:
+            db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
 
 with open(URLS_FILE, "r", encoding="utf-8") as f:
     regels = [r.strip() for r in f if r.strip() and not r.strip().startswith("#")]
 
 log(f"{len(regels)} zoekopdracht(en) gevonden.")
+
+nieuwe_db = {}
 
 for regel in regels:
     if "|" in regel and not regel.startswith("http"):
@@ -212,8 +210,8 @@ for regel in regels:
     else:
         naam, url = bedenk_naam(regel), regel
 
-    is_nieuwe_url = url not in bekende_urls
-    bekende_urls.add(url)
+    is_nieuwe_url = url not in db
+    geziene_ids = db.get(url, set())
     log(f"Controleren: {naam} (eerste keer: {is_nieuwe_url})")
 
     try:
@@ -221,6 +219,7 @@ for regel in regels:
         log(f" -> {len(advertenties)} advertenties opgehaald.")
     except Exception as e:
         log(f" -> Fout bij ophalen van {naam}: {e}")
+        nieuwe_db[url] = sorted(geziene_ids)
         continue
 
     nieuwe_aantal = 0
@@ -243,10 +242,11 @@ for regel in regels:
             )
             stuur_telegram(telegram_bericht)
 
+    nieuwe_db[url] = sorted(geziene_ids)
     log(f" -> {nieuwe_aantal} nieuwe ID's verwerkt.")
     time.sleep(1)
 
 with open(DB_FILE, "w", encoding="utf-8") as f:
-    json.dump({"urls": list(bekende_urls), "ids": list(geziene_ids)}, f)
+    json.dump(nieuwe_db, f, indent=2)
 
 log("Klaar! Database opgeslagen.")
