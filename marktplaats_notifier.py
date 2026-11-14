@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
+
 DB_FILE = "geziene_advertenties.json"
 URLS_FILE = "zoekopdrachten.txt"
 
@@ -47,7 +48,7 @@ def stuur_telegram(tekst, parse_mode="HTML"):
         elif not resp.ok:
             log(f"⚠️ Telegram melding geweigerd ({resp.status_code}): {resp.text}")
     except Exception as e:
-        log(f"⚠️ Telegram timeout/verbindingsfout: {e}")
+        log(f"⚠️ Telegram timeout/verbindingsfout ({e}), overige meldingen worden overgeslagen.")
         telegram_bereikbaar = False
 
 
@@ -95,12 +96,6 @@ def haal_advertenties_op(url):
     resp.raise_for_status()
     html_tekst = resp.text
 
-    # 1. Haal categorie-ID's (voor /l/ links) en zoekterm uit de paginabron
-    for cat_key in ("l1CategoryId", "l2CategoryId"):
-        m = re.search(rf'"{cat_key}"\s*:\s*(\d+)', html_tekst)
-        if m:
-            api_params[cat_key] = int(m.group(1))
-
     soup = BeautifulSoup(html_tekst, "html.parser")
     next_data_tag = soup.find("script", id="__NEXT_DATA__")
     fallback_listings = []
@@ -110,6 +105,13 @@ def haal_advertenties_op(url):
             next_data = json.loads(next_data_tag.string)
             page_props = next_data.get("props", {}).get("pageProps", {})
             search_req = page_props.get("searchRequest", {})
+
+            sr_tekst = json.dumps(search_req)
+            for cat_key in ("l1CategoryId", "l2CategoryId"):
+                m = re.search(rf'"{cat_key}"\s*:\s*(\d+)', sr_tekst)
+                if m:
+                    api_params[cat_key] = int(m.group(1))
+
             if search_req.get("query"):
                 api_params["query"] = search_req["query"]
             for veld in ("postcode", "distanceMeters"):
@@ -125,7 +127,6 @@ def haal_advertenties_op(url):
         q_deel = parsed.path.split("/q/", 1)[1].strip("/").split("/")[0]
         api_params["query"] = unquote(q_deel).replace("+", " ").replace("-", " ")
 
-    # 2. Verwerk eventuele filters uit het #-fragment
     for deel in parsed.fragment.split("|"):
         if ":" not in deel:
             continue
@@ -139,10 +140,12 @@ def haal_advertenties_op(url):
         else:
             attributes.append(f"{k}:{v}")
 
+    if "postcode" in api_params and "distanceMeters" not in api_params:
+        api_params["distanceMeters"] = 100000
+
     if attributes:
         api_params["attributesByKey[]"] = list(dict.fromkeys(attributes))
 
-    # 3. Vraag gesorteerde JSON-resultaten op via de zoek-API
     api_headers = {**HEADERS, "Accept": "application/json", "Referer": basis_url}
     api_resp = requests.get(
         "https://www.marktplaats.nl/lrp/api/search",
@@ -217,12 +220,13 @@ for regel in regels:
             veilige_naam = html.escape(naam)
             veilige_titel = html.escape(ad["titel"])
             veilige_prijs = html.escape(ad["prijs"])
-            stuur_telegram(
+            telegram_bericht = (
                 f"🆕 <b>{veilige_naam}</b>\n"
                 f"{veilige_titel}\n"
                 f"Prijs: {veilige_prijs}\n"
                 f"<a href=\"{ad['link']}\">Bekijk advertentie</a>"
             )
+            stuur_telegram(telegram_bericht)
 
     log(f" -> {nieuwe_aantal} nieuwe ID's verwerkt.")
     time.sleep(1)
