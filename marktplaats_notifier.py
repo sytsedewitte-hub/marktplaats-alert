@@ -88,7 +88,7 @@ def formatteer_prijs(price_info):
         "SEE_DESCRIPTION": "Zie omschrijving",
     }
 
-    if ptype not in ("FIXED", "MIN_BID") and ptype in vaste_labels:
+    if ptype not in ("FIXED", "MIN_BID", "FAST_BID", "FREE_BID", "BID") and ptype in vaste_labels:
         return vaste_labels[ptype]
 
     if cents is not None and cents > 0:
@@ -147,6 +147,9 @@ def haal_advertenties_op(url):
 
             if search_req.get("query"):
                 api_params["query"] = search_req["query"]
+            if search_req.get("searchInTitleAndDescription"):
+                api_params["searchInTitleAndDescription"] = "true"
+
             dist_obj = search_req.get("distance") or {}
             if dist_obj.get("postcode"):
                 api_params["postcode"] = dist_obj["postcode"]
@@ -154,7 +157,13 @@ def haal_advertenties_op(url):
                 api_params["distanceMeters"] = dist_obj["distanceMeters"]
 
             for attr in search_req.get("attributesByKey", []):
-                attributes.append(attr)
+                if isinstance(attr, str):
+                    attributes.append(attr)
+                elif isinstance(attr, dict):
+                    k = attr.get("attributeKey") or attr.get("key")
+                    v = attr.get("attributeValue") or attr.get("value")
+                    if k and v:
+                        attributes.append(f"{k}:{v}")
 
             fallback_listings = srar.get("listings", [])
         except Exception as e:
@@ -162,18 +171,34 @@ def haal_advertenties_op(url):
 
     if "query" not in api_params and "/q/" in parsed.path:
         q_deel = parsed.path.split("/q/", 1)[1].strip("/").split("/")[0]
-        api_params["query"] = unquote(q_deel).replace("+", " ").replace("-", " ")
+        api_params["query"] = unquote(q_deel).replace("+", " ")
 
-    for deel in parsed.fragment.split("|"):
+    genegeerde_params = {
+        "sortBy",
+        "sortOrder",
+        "limit",
+        "offset",
+        "asSavedSearch",
+        "fromSavedSearch",
+        "viewOptions",
+        "origin",
+    }
+
+    fragment_tekst = parsed.fragment.replace("#", "|")
+    for deel in fragment_tekst.split("|"):
         if ":" not in deel:
             continue
-        k, v = deel.split(":", 1)
-        if k in ("sortBy", "sortOrder", "limit", "offset"):
+        k, v = [x.strip() for x in deel.split(":", 1)]
+        if not k or not v or k in genegeerde_params:
             continue
         elif k == "q":
             api_params["query"] = unquote(v).replace("+", " ")
-        elif k in ("postcode", "distanceMeters"):
-            api_params[k] = v
+        elif k == "searchInTitleAndDescription":
+            api_params["searchInTitleAndDescription"] = v.lower()
+        elif k == "postcode":
+            api_params["postcode"] = unquote(v).replace(" ", "").upper()
+        elif k == "distanceMeters":
+            api_params["distanceMeters"] = v
         else:
             attributes.append(f"{k}:{v}")
 
@@ -184,16 +209,21 @@ def haal_advertenties_op(url):
         api_params["attributesByKey[]"] = list(dict.fromkeys(attributes))
 
     api_headers = {**HEADERS, "Accept": "application/json", "Referer": basis_url}
-    api_resp = requests.get(
-        "https://www.marktplaats.nl/lrp/api/search",
-        params=api_params,
-        headers=api_headers,
-        timeout=10,
-    )
-    api_resp.raise_for_status()
-
-    api_listings = api_resp.json().get("listings", []) if api_resp.text.strip() else []
-    listings = api_listings if api_listings else fallback_listings
+    try:
+        api_resp = requests.get(
+            "https://www.marktplaats.nl/lrp/api/search",
+            params=api_params,
+            headers=api_headers,
+            timeout=10,
+        )
+        api_resp.raise_for_status()
+        listings = api_resp.json().get("listings", []) if api_resp.text.strip() else []
+    except Exception as e:
+        if "postcode" not in api_params and not attributes and fallback_listings:
+            log(f"    [Debug] API fout ({e}), gebruik fallback_listings.")
+            listings = fallback_listings
+        else:
+            raise
 
     resultaten = []
     for item in listings:
@@ -246,7 +276,8 @@ for regel in regels:
         log(f" -> {len(advertenties)} advertenties opgehaald.")
     except Exception as e:
         log(f" -> Fout bij ophalen van {naam}: {e}")
-        nieuwe_db[url] = sorted(geziene_ids)
+        if not is_nieuwe_url:
+            nieuwe_db[url] = sorted(geziene_ids)
         continue
 
     nieuwe_ids_aantal = 0
