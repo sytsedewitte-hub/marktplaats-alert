@@ -2,6 +2,9 @@ name: Check Marktplaats
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'zoekopdrachten.txt'
 
 concurrency:
   group: marktplaats-check
@@ -37,6 +40,6 @@ jobs:
           git add geziene_advertenties.json
           if ! git diff --cached --quiet; then
             git commit -m "Update geziene advertenties"
-            git pull --rebase --autostash -X ours
+            git pull --rebase --autostash -X theirs
             git push
           fi
