@@ -62,6 +62,11 @@ def bedenk_naam(url):
     return "Marktplaats Zoekopdracht"
 
 
+def haal_id_nummer(ad_id):
+    cijfers = re.sub(r"\D", "", str(ad_id))
+    return int(cijfers) if cijfers else 0
+
+
 def formatteer_prijs(price_info):
     if not price_info:
         return "Onbekend"
@@ -97,14 +102,13 @@ def haal_advertenties_op(url):
     basis_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
     api_params = {
-        "limit": 30,
+        "limit": 100,
         "offset": 0,
         "sortBy": "SORT_INDEX",
         "sortOrder": "DECREASING",
         "viewOptions": "list-view",
     }
     attributes = []
-    l2_id = None
 
     resp = requests.get(basis_url, headers=HEADERS, timeout=10)
     resp.raise_for_status()
@@ -132,23 +136,25 @@ def haal_advertenties_op(url):
 
             l2_raw = query_obj.get("l2CategoryIds")
             l2_list = cats.get("l2Categories") or []
+            l2_id = None
             if l2_raw:
                 l2_id = int(str(l2_raw).split(",")[0])
             elif l2_list and isinstance(l2_list[0], dict) and l2_list[0].get("id"):
                 l2_id = int(l2_list[0]["id"])
 
             if l2_id:
-                api_params["l2CategoryId"] = l2_id
-                api_params["l2CategoryIds"] = str(l2_id)
+                api_params["l2CategoryIds[]"] = [l2_id]
 
             if search_req.get("query"):
                 api_params["query"] = search_req["query"]
+            dist_obj = search_req.get("distance") or {}
+            if dist_obj.get("postcode"):
+                api_params["postcode"] = dist_obj["postcode"]
+            if dist_obj.get("distanceMeters") is not None:
+                api_params["distanceMeters"] = dist_obj["distanceMeters"]
 
             for attr in search_req.get("attributesByKey", []):
-                if isinstance(attr, str):
-                    attributes.append(attr)
-                elif isinstance(attr, dict) and attr.get("attributeKey") and attr.get("attributeValueKey"):
-                    attributes.append(f"{attr['attributeKey']}:{attr['attributeValueKey']}")
+                attributes.append(attr)
 
             fallback_listings = srar.get("listings", [])
         except Exception as e:
@@ -171,9 +177,8 @@ def haal_advertenties_op(url):
         else:
             attributes.append(f"{k}:{v}")
 
-    # Als er geen afstand in de URL staat (Heel NL), laat postcode dan ook weg
-    if "distanceMeters" not in api_params:
-        api_params.pop("postcode", None)
+    if "postcode" in api_params and "distanceMeters" not in api_params:
+        api_params["distanceMeters"] = 100000
 
     if attributes:
         api_params["attributesByKey[]"] = list(dict.fromkeys(attributes))
@@ -194,17 +199,14 @@ def haal_advertenties_op(url):
     for item in listings:
         ad_id = str(item.get("itemId") or "")
         vip_url = item.get("vipUrl")
-        # Sla commerciële Admarkt-advertenties ('a...') over
+        # Sla commerciële Admarkt-advertenties (beginnen met 'a') over
         if not ad_id or not vip_url or ad_id.startswith("a"):
             continue
-        # Harde check: negeer advertenties uit andere subcategorieën als l2_id bekend is
-        if l2_id and item.get("categoryId") and int(item["categoryId"]) != l2_id:
-            continue
-
         resultaten.append({
             "id": ad_id,
             "titel": item.get("title") or "Nieuwe advertentie",
             "prijs": formatteer_prijs(item.get("priceInfo")),
+            "datum": str(item.get("date") or ""),
             "link": urljoin("https://www.marktplaats.nl", vip_url.split("?")[0]),
         })
     return resultaten
@@ -215,12 +217,9 @@ log("Start Marktplaats controle...")
 db = {}
 if os.path.exists(DB_FILE):
     with open(DB_FILE, "r", encoding="utf-8") as f:
-        try:
-            ruwe_data = json.load(f)
-            if isinstance(ruwe_data, dict) and "urls" not in ruwe_data:
-                db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
-        except Exception:
-            db = {}
+        ruwe_data = json.load(f)
+        if isinstance(ruwe_data, dict) and "urls" not in ruwe_data:
+            db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
 
 with open(URLS_FILE, "r", encoding="utf-8") as f:
     regels = [r.strip() for r in f if r.strip() and not r.strip().startswith("#")]
@@ -237,6 +236,9 @@ for regel in regels:
 
     is_nieuwe_url = url not in db
     geziene_ids = db.get(url, set())
+    bestaande_nummers = [haal_id_nummer(i) for i in geziene_ids]
+    hoogste_bekende_id = max(bestaande_nummers) if bestaande_nummers else 0
+
     log(f"Controleren: {naam} (eerste keer: {is_nieuwe_url})")
 
     try:
@@ -247,15 +249,19 @@ for regel in regels:
         nieuwe_db[url] = sorted(geziene_ids)
         continue
 
-    nieuwe_aantal = 0
+    nieuwe_ids_aantal = 0
+    gepusht_aantal = 0
+
     for ad in advertenties:
         if ad["id"] in geziene_ids:
             continue
 
         geziene_ids.add(ad["id"])
-        nieuwe_aantal += 1
+        nieuwe_ids_aantal += 1
+        ad_nummer = haal_id_nummer(ad["id"])
 
-        if not is_nieuwe_url:
+        if not is_nieuwe_url and ad["datum"] == "Vandaag" and ad_nummer > hoogste_bekende_id:
+            gepusht_aantal += 1
             veilige_naam = html.escape(naam)
             veilige_titel = html.escape(ad["titel"])
             veilige_prijs = html.escape(ad["prijs"])
@@ -268,7 +274,7 @@ for regel in regels:
             stuur_telegram(telegram_bericht)
 
     nieuwe_db[url] = sorted(geziene_ids)
-    log(f" -> {nieuwe_aantal} nieuwe ID's verwerkt.")
+    log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
     time.sleep(1)
 
 with open(DB_FILE, "w", encoding="utf-8") as f:
