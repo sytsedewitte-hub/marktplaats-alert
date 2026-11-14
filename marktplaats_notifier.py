@@ -70,27 +70,26 @@ def formatteer_prijs(price_info):
     cents = price_info.get("priceCents")
 
     vaste_labels = {
+        "BID": "Bieden",
         "EXCHANGE": "Ruilen",
         "FAST_BID": "Bieden",
         "FREE": "Gratis",
         "FREE_BID": "Bieden",
+        "MIN_BID": "Bieden",
         "NOTK": "N.o.t.k.",
         "NVT": "N.v.t.",
         "ON_REQUEST": "Op aanvraag",
         "RESERVED": "Gereserveerd",
         "SEE_DESCRIPTION": "Zie omschrijving",
     }
-    if ptype in vaste_labels:
+
+    if ptype not in ("FIXED", "MIN_BID") and ptype in vaste_labels:
         return vaste_labels[ptype]
 
     if cents is not None and cents > 0:
-        bedrag = f"€ {cents / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return f"Bieden vanaf {bedrag}" if ptype == "MIN_BID" else bedrag
+        return f"€ {cents / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    if ptype == "MIN_BID":
-        return "Bieden"
-
-    return f"Onbekend ({ptype})" if ptype else "Onbekend"
+    return vaste_labels.get(ptype, "Onbekend")
 
 
 def haal_advertenties_op(url):
