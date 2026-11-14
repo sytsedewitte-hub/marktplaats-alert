@@ -105,12 +105,14 @@ def haal_advertenties_op(url):
             next_data = json.loads(next_data_tag.string)
             page_props = next_data.get("props", {}).get("pageProps", {})
             search_req = page_props.get("searchRequest", {})
+            cat_obj = page_props.get("category", {})
 
-            sr_tekst = json.dumps(search_req)
-            for cat_key in ("l1CategoryId", "l2CategoryId"):
-                m = re.search(rf'"{cat_key}"\s*:\s*(\d+)', sr_tekst)
-                if m:
-                    api_params[cat_key] = int(m.group(1))
+            for bron in (search_req, page_props, cat_obj):
+                if not isinstance(bron, dict):
+                    continue
+                for cat_key in ("l1CategoryId", "l2CategoryId", "categoryId"):
+                    if bron.get(cat_key) is not None and cat_key not in api_params:
+                        api_params[cat_key] = int(bron[cat_key])
 
             if search_req.get("query"):
                 api_params["query"] = search_req["query"]
@@ -155,10 +157,8 @@ def haal_advertenties_op(url):
     )
     api_resp.raise_for_status()
 
-    if api_resp.text.strip():
-        listings = api_resp.json().get("listings", [])
-    else:
-        listings = fallback_listings
+    api_listings = api_resp.json().get("listings", []) if api_resp.text.strip() else []
+    listings = api_listings if api_listings else fallback_listings
 
     resultaten = []
     for item in listings:
