@@ -1,90 +1,45 @@
-# 🛒 Marktplaats Alert Bot (via Telegram & GitHub Actions)
+# 🛒 Marktplaats Alert Bot
 
-Ontvang automatisch een Telegram-bericht zodra er een nieuwe advertentie op Marktplaats wordt geplaatst die voldoet aan jouw zoekopdrachten of (sub)categorieën. 
-
-Je beheert je zoekopdrachten eenvoudig vanuit je Telegram-chat: plak een Marktplaats-link, kies met één druk op de knop de maximale afstand, en de bot doet de rest. Alles draait **100% gratis** op GitHub Actions en Cloudflare Workers.
+Ontvang automatisch een Telegram-bericht bij nieuwe Marktplaats-advertenties en beheer al je zoekopdrachten vanuit de chat. Draait **100% gratis** op GitHub Actions en Cloudflare Workers.
 
 ---
 
 ## ✨ Functies
-* **Ondersteunt alle zoek- en categoriepagina's:** Werkt voor zowel zoektermen (`/q/...`) als specifieke subcategorieën (`/l/.../...`), inclusief filters.
-* **Geen reclame-spam:** Commerciële Admarkt-advertenties (`a`-nummers) worden automatisch overgeslagen.
-* **Interactieve Telegram-bot:**
-  * Plak een Marktplaats-link en kies direct de afstand via knoppen (**30, 50, 75, 100, 125 km** of **Heel NL**).
-  * `/lijst` — Bekijk al je actieve zoekopdrachten.
-  * `/verwijder [nummer]` — Verwijder een zoekopdracht uit je lijst.
-* **Slimme opslag:** Bij een nieuwe zoekopdracht worden de eerste 30 bestaande advertenties stil opgeslagen, zodat je alleen meldingen krijgt van écht nieuwe advertenties.
+* **Zoektermen & subcategorieën:** Werkt met elke Marktplaats-link (`/q/...` en `/l/...`), inclusief filters.
+* **Slimme filtering:** Negeert reclames (Admarkt), dubbele meldingen en oude advertenties die omhoog zijn geplaatst.
+* **Snel beheer via Telegram:** Plak een link en kies de straal (**30 t/m 125 km** of **Heel NL**), bekijk je lijst met `/lijst` of verwijder via `/verwijder [nummer]`.
+* **Geen opstart-spam:** Bij een nieuwe zoekopdracht worden bestaande advertenties (tot 100) stil opgeslagen.
 
 ---
 
-## 🚀 Installatiehandleiding
+## 🚀 Installatie
 
-Volg deze 4 stappen om je eigen versie op te zetten.
+### Stap 1: Telegram Bot aanmaken
+1. Open **@BotFather** in Telegram, stuur `/newbot` en kopieer je **`TELEGRAM_TOKEN`**.
+2. Open **@userinfobot**, klik op *Start* en kopieer je **`TELEGRAM_CHAT_ID`**.
 
-### Stap 1: Maak een Telegram Bot en achterhaal je Chat ID
-1. Open Telegram en zoek naar **@BotFather**.
-2. Stuur `/newbot`, kies een naam en een gebruikersnaam (eindigend op `bot`).
-3. Kopieer de **API Token** die je krijgt (bijv. `123456789:ABCdefGHI...`).
-4. Zoek in Telegram naar **@userinfobot** en klik op *Start* om je persoonlijke **Chat ID** (een reeks cijfers) op te vragen.
+### Stap 2: GitHub instellen
+1. Klik rechtsboven op **Fork** om een eigen kopie te maken.
+2. Ga naar **Settings → Actions → General**, zet *Workflow permissions* op **Read and write permissions** en klik op **Save**.
+3. Ga naar het tabblad **Actions**, zet de workflows aan, klik links op **Reset lijsten (eenmalig na Fork)** en kies **Run workflow**.
+4. Ga naar **Settings → Secrets and variables → Actions** en voeg `TELEGRAM_TOKEN` en `TELEGRAM_CHAT_ID` toe.
+5. Maak een **Personal Access Token (classic)** aan via *GitHub Profiel → Settings → Developer settings → Personal access tokens*, vink **`repo`** aan en kopieer het token.
 
----
+### Stap 3: Telegram-bot uitrollen via Cloudflare
+Klik op onderstaande knop en vul je gegevens in (`TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `GITHUB_TOKEN`, `GITHUB_REPO` als `jouwnaam/marktplaats-alert` en `STANDAARD_POSTCODE` als `1234AB`):
 
-### Stap 2: Kopieer deze repository naar je eigen GitHub
-1. Klik rechtsboven op **Use this template** (of **Fork**) om een kopie in je eigen GitHub-account te maken.
-2. Ga in jouw nieuwe repository naar **Settings** → **Secrets and variables** → **Actions**.
-3. Klik op **New repository secret** en voeg deze twee secrets toe:
-   * `TELEGRAM_TOKEN`: jouw bot-token uit Stap 1.
-   * `TELEGRAM_CHAT_ID`: jouw persoonlijke Chat ID uit Stap 1.
-4. Ga naar **Settings** → **Actions** → **General**, scroll helemaal naar beneden naar **Workflow permissions**, kies **Read and write permissions** en klik op **Save**.
-5. Maak tot slot een **Personal Access Token** aan zodat je Telegram-bot straks `zoekopdrachten.txt` mag aanpassen:
-   * Ga rechtsboven op GitHub naar je profielfoto → **Settings** → **Developer settings** (helemaal onderaan) → **Personal access tokens** → **Tokens (classic)**.
-   * Klik op **Generate new token (classic)**, geef hem een naam, vink **`repo`** aan en kopieer het gegenereerde token (`ghp_...`).
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sytsedewitte-hub/marktplaats-alert/tree/main/worker)
 
----
-
-### Stap 3: Stel de Cloudflare Worker in (voor Telegram-commando's)
-Met een gratis Cloudflare Worker kun je links en commando's naar je bot sturen.
-
-1. Maak een gratis account aan op [dash.cloudflare.com](https://dash.cloudflare.com).
-2. Ga in het menu links naar **Workers & Pages** → **Create** → **Create Worker**.
-3. Geef de worker een naam (bijv. `marktplaats-bot`) en klik op **Deploy**.
-4. Klik op **Edit code**, verwijder de voorbeeldcode, plak de code uit `worker.js` erin en klik rechtsboven op **Deploy**.
-5. Ga terug naar het overzicht van je Worker → **Settings** → **Variables and Secrets** en voeg de volgende variabelen toe:
-   * `TELEGRAM_TOKEN`: je Telegram bot-token.
-   * `TELEGRAM_CHAT_ID`: je Telegram Chat ID.
-   * `GITHUB_TOKEN`: je GitHub Personal Access Token (`ghp_...`) uit Stap 2.
-   * `GITHUB_REPO`: jouw gebruikersnaam en repositorynaam, bijv. `jouwnaam/marktplaats-alert`.
-   * `STANDAARD_POSTCODE`: je postcode zonder spaties, bijv. `1234AB` (wordt gebruikt als je een afstand kiest).
-6. **Koppel Telegram aan je Worker:** Open onderstaande link in je browser (vervang `<TELEGRAM_TOKEN>` en `<WORKER_URL>` door jouw gegevens):
-   ```text
-   https://api.telegram.org/bot<TELEGRAM_TOKEN>/setWebhook?url=<WORKER_URL>
-   ```
-   *(Je ziet `{"ok":true,"result":true,"description":"Webhook was set"}` als het gelukt is.)*
+### Stap 4: Koppelen & Automatiseren
+1. Open de Worker-URL die Cloudflare na installatie geeft en plak **`/setup`** achter het adres (bijv. `https://marktplaats-telegram-bot.jouwnaam.workers.dev/setup`).
+2. Wil je automatische checks? Zet in `.github/workflows/check.yml` onder `on:` een schema aan (bijv. `cron: '*/15 * * * *'`), of trigger de workflow via [cron-job.org](https://cron-job.org).
 
 ---
 
-### Stap 4: Automatisch laten controleren
-Standaard draait de check zodra je een zoekopdracht toevoegt of handmatig via het tabblad **Actions** → **Check Marktplaats** → **Run workflow**.
+## 📱 Gebruik
 
-Wil je dat hij automatisch elke 10 of 15 minuten controleert?
-* Voeg onder `on:` in `.github/workflows/check.yml` een `schedule` toe:
-  ```yaml
-  on:
-    workflow_dispatch:
-    push:
-      paths:
-        - 'zoekopdrachten.txt'
-    schedule:
-      - cron: '*/15 * * * *'
-  ```
-* *(Tip: GitHub Actions kan op drukke momenten vertraging hebben op `schedule`. Voor stipte checks elke 5 of 10 minuten kun je ook een gratis account op [cron-job.org](https://cron-job.org) gebruiken om de GitHub workflow aan te roepen).*
+1. Kopieer een zoek- of categorielink op Marktplaats.
+2. Plak de link in je Telegram-chat met de bot en tik op de gewenste afstand.
+3. Klaar! Nieuwe advertenties komen direct binnen met prijs en directe link.
 
----
-
-## 📱 Gebruik in Telegram
-
-1. Open Marktplaats in je browser of app en zoek naar een product of open een specifieke subcategorie.
-2. Kopieer de link uit de adresbalk (bijv. `https://www.marktplaats.nl/l/spelcomputers-en-games/spelcomputers-sony-playstation-5/`).
-3. Plak de link in je Telegram-chat met de bot.
-4. Kies via de knoppen onder het bericht de gewenste straal (**30 km** t/m **125 km** of **Heel NL**).
-5. Klaar! Zodra er een nieuwe advertentie verschijnt, ontvang je direct een bericht met prijs en directe link.
+*Updates binnenhalen? Klik in je eigen repository op **Sync fork**.*
