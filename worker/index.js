@@ -289,6 +289,62 @@ async function voegZoekopdrachtToe(env, url) {
   return `✅ Toegevoegd:\n<b>${maakLeesbareNaam(url)}</b>`;
 }
 
+async function sha256Bytes(tekst) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(tekst));
+  return new Uint8Array(buf);
+}
+
+function bytesToHex(bytes) {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+async function versleutel(tekst, sleutel) {
+  if (!tekst) return "";
+  const nonceBytes = crypto.getRandomValues(new Uint8Array(16));
+  const nonce = bytesToHex(nonceBytes);
+  const data = new TextEncoder().encode(tekst);
+  const out = new Uint8Array(data.length);
+
+  for (let i = 0; i < data.length; i += 32) {
+    const blok = await sha256Bytes(`mp-enc:${sleutel}:${nonce}:${i / 32}`);
+    for (let j = 0; j < Math.min(32, data.length - i); j++) {
+      out[i + j] = data[i + j] ^ blok[j];
+    }
+  }
+
+  const cipherHex = bytesToHex(out);
+  const mac = bytesToHex(await sha256Bytes(`mp-mac:${sleutel}:${nonce}:${cipherHex}`)).slice(0, 32);
+  return `ENC1:${nonce}:${mac}:${cipherHex}`;
+}
+
+async function ontsleutel(inhoud, sleutel) {
+  const delen = inhoud.trim().split(":");
+  if (delen.length !== 4 || delen[0] !== "ENC1") return null;
+  const [, nonce, mac, cipherHex] = delen;
+  const verwachtMac = bytesToHex(await sha256Bytes(`mp-mac:${sleutel}:${nonce}:${cipherHex}`)).slice(0, 32);
+  if (mac !== verwachtMac) return null;
+
+  const cipher = hexToBytes(cipherHex);
+  const out = new Uint8Array(cipher.length);
+  for (let i = 0; i < cipher.length; i += 32) {
+    const blok = await sha256Bytes(`mp-enc:${sleutel}:${nonce}:${i / 32}`);
+    for (let j = 0; j < Math.min(32, cipher.length - i); j++) {
+      out[i + j] = cipher[i + j] ^ blok[j];
+    }
+  }
+  return new TextDecoder("utf-8").decode(out);
+}
+
 async function haalBestandOp(env) {
   const apiUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/contents/zoekopdrachten.txt`;
   const resp = await fetch(apiUrl, {
@@ -307,8 +363,21 @@ async function haalBestandOp(env) {
   }
 
   const data = await resp.json();
-  const inhoud = base64DecodeUtf8(data.content);
-  const regels = inhoud
+  const inhoud = base64DecodeUtf8(data.content).trim();
+  if (!inhoud) {
+    return { regels: [], sha: data.sha, ok: true, status: 200 };
+  }
+
+  let tekst = inhoud;
+  if (inhoud.startsWith("ENC1:")) {
+    const ontsleuteld = await ontsleutel(inhoud, env.TELEGRAM_TOKEN);
+    if (ontsleuteld === null) {
+      return { regels: [], sha: data.sha, ok: true, status: 200 };
+    }
+    tekst = ontsleuteld;
+  }
+
+  const regels = tekst
     .split("\n")
     .map((r) => r.trim())
     .filter((r) => r && !r.startsWith("#"));
@@ -318,7 +387,11 @@ async function haalBestandOp(env) {
 
 async function slaBestandOp(env, regels, sha, commitMsg) {
   const apiUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/contents/zoekopdrachten.txt`;
-  const nieuweInhoud = base64EncodeUtf8(regels.length > 0 ? regels.join("\n") + "\n" : "");
+  const platteTekst = regels.length > 0 ? regels.join("\n") : "";
+  const versleuteldeTekst = platteTekst
+    ? (await versleutel(platteTekst, env.TELEGRAM_TOKEN)) + "\n"
+    : "";
+  const nieuweInhoud = base64EncodeUtf8(versleuteldeTekst);
 
   const resp = await fetch(apiUrl, {
     method: "PUT",
