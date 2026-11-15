@@ -1,0 +1,45 @@
+name: Check Marktplaats
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'zoekopdrachten.txt'
+
+concurrency:
+  group: marktplaats-check
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installeer dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Controleer Marktplaats
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -u marktplaats_notifier.py
+
+      - name: Sla geziene advertenties op
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add geziene_advertenties.json zoekopdrachten.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Update geziene advertenties"
+            git pull --rebase --autostash -X theirs
+            git push
+          fi
