@@ -306,14 +306,46 @@ def haal_advertenties_op(url):
         # Sla commerciële Admarkt-advertenties (beginnen met 'a') over
         if not ad_id or not vip_url or ad_id.startswith("a"):
             continue
+        seller_info = item.get("sellerInformation") or {}
         resultaten.append({
             "id": ad_id,
             "titel": item.get("title") or "Nieuwe advertentie",
             "prijs": formatteer_prijs(item.get("priceInfo")),
             "datum": str(item.get("date") or "").strip(),
             "link": urljoin("https://www.marktplaats.nl", vip_url.split("?")[0]),
+            "seller_id": seller_info.get("sellerId"),
         })
     return resultaten
+
+
+def is_nieuwe_verkoper(ad_url, seller_id=None, cache=None):
+    if cache is not None and seller_id is not None and seller_id in cache:
+        return cache[seller_id]
+
+    is_nieuw = False
+    try:
+        resp = requests.get(ad_url, headers=HEADERS, timeout=5)
+        resp.raise_for_status()
+        html_tekst = resp.text
+
+        actief_sinds = ""
+        m = re.search(r'"activeSinceDiff"\s*:\s*"([^"]+)"', html_tekst)
+        if m:
+            actief_sinds = m.group(1)
+        else:
+            m_html = re.search(r">\s*([^<]+?)\s+op Marktplaats\s*<", html_tekst, re.IGNORECASE)
+            if m_html:
+                actief_sinds = m_html.group(1)
+
+        actief_norm = actief_sinds.strip().lower()
+        if re.match(r"^0\s+dag", actief_norm) or actief_norm == "vandaag":
+            is_nieuw = True
+    except Exception:
+        return False
+
+    if cache is not None and seller_id is not None:
+        cache[seller_id] = is_nieuw
+    return is_nieuw
 
 
 log("Start Marktplaats controle...")
@@ -362,6 +394,7 @@ else:
 log(f"{len(regels)} zoekopdracht(en) gevonden.")
 
 nieuwe_db = {}
+verkoper_cache = {}
 
 for idx, regel in enumerate(regels, start=1):
     if "|" in regel and not regel.startswith("http"):
@@ -387,6 +420,7 @@ for idx, regel in enumerate(regels, start=1):
 
     nieuwe_ids_aantal = 0
     gepusht_aantal = 0
+    gefilterd_aantal = 0
 
     for ad in advertenties:
         if ad["id"] in geziene_ids:
@@ -402,6 +436,10 @@ for idx, regel in enumerate(regels, start=1):
         if ad["datum"].lower() != "vandaag" or ad_nummer <= hoogste_bekende_id:
             continue
 
+        if is_nieuwe_verkoper(ad["link"], ad.get("seller_id"), verkoper_cache):
+            gefilterd_aantal += 1
+            continue
+
         gepusht_aantal += 1
         veilige_naam = html.escape(naam)
         veilige_titel = html.escape(ad["titel"])
@@ -415,7 +453,10 @@ for idx, regel in enumerate(regels, start=1):
         stuur_telegram(telegram_bericht)
 
     nieuwe_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
-    log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
+    if gefilterd_aantal > 0:
+        log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd, {gefilterd_aantal} gefilterd op 0-dagen verkoper).")
+    else:
+        log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
     time.sleep(1)
 
 versleutelde_db = {"data": versleutel(json.dumps(nieuwe_db), TOKEN)} if nieuwe_db else {}
