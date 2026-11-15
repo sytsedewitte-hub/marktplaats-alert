@@ -4,15 +4,22 @@ export default {
 
     // Automatische webhook-koppeling via https://<jouw-worker>.workers.dev/setup
     if (request.method === "GET" && url.pathname === "/setup") {
+      if (!env.TELEGRAM_TOKEN) {
+        return new Response("❌ TELEGRAM_TOKEN ontbreekt in de Worker-instellingen.", {
+          status: 500,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
       const webhookUrl = `${url.origin}/`;
+      const secretToken = await maakSecretToken(env.TELEGRAM_TOKEN);
       const resp = await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`
+        `https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}&secret_token=${encodeURIComponent(secretToken)}`
       );
       const data = await resp.json();
       return new Response(
         data.ok
           ? `✅ Telegram webhook succesvol gekoppeld aan ${webhookUrl}`
-          : `❌ Fout bij koppelen: ${JSON.stringify(data)}`,
+          : `❌ Fout bij koppelen: ${data.description || "Onbekende fout"}`,
         { status: data.ok ? 200 : 400, headers: { "Content-Type": "text/plain; charset=utf-8" } }
       );
     }
@@ -21,18 +28,32 @@ export default {
       return new Response("OK", { status: 200 });
     }
 
-    const update = await request.json();
+    // Controleer Telegram secret header indien meegezonden
+    const headerSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+    if (headerSecret && env.TELEGRAM_TOKEN) {
+      const verwachtSecret = await maakSecretToken(env.TELEGRAM_TOKEN);
+      if (headerSecret !== verwachtSecret) {
+        return new Response("Unauthorized", { status: 403 });
+      }
+    }
+
+    let update;
+    try {
+      update = await request.json();
+    } catch {
+      return new Response("Bad Request", { status: 400 });
+    }
 
     // 1. Klik op afstandsknop afhandelen (Inline Keyboard)
     if (update.callback_query) {
       const cq = update.callback_query;
-      const chatId = String(cq.message.chat.id);
+      const chatId = String(cq.message?.chat?.id || "");
       if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
         return new Response("Unauthorized", { status: 403 });
       }
 
       const kmMatch = (cq.data || "").match(/^km:(\d+)$/);
-      const urlMatch = (cq.message.text || "").match(/https?:\/\/(?:www\.)?marktplaats\.nl\/(?:l|q)\/\S+/i);
+      const urlMatch = (cq.message?.text || "").match(/https?:\/\/(?:www\.)?marktplaats\.nl\/(?:l|q)\/\S+/i);
 
       if (kmMatch && urlMatch) {
         const km = parseInt(kmMatch[1], 10);
@@ -59,8 +80,14 @@ export default {
 
     // 2. Commando: /lijst
     if (tekst === "/lijst") {
-      const { regels } = await haalBestandOp(env);
-      if (regels.length === 0) {
+      const { regels, ok, status } = await haalBestandOp(env);
+      if (!ok) {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `❌ Kon zoekopdrachten niet ophalen van GitHub (HTTP ${status}). Controleer <code>GITHUB_TOKEN</code> en <code>GITHUB_REPO</code>.`
+        );
+      } else if (regels.length === 0) {
         await stuurBericht(env.TELEGRAM_TOKEN, chatId, "Je lijst met zoekopdrachten is nog leeg.");
       } else {
         const overzicht = regels
@@ -74,7 +101,16 @@ export default {
     // 3. Commando: /verwijder <nummer>
     if (tekst.startsWith("/verwijder")) {
       const nr = parseInt(tekst.replace("/verwijder", "").trim(), 10);
-      const { regels, sha } = await haalBestandOp(env);
+      const { regels, sha, ok, status } = await haalBestandOp(env);
+
+      if (!ok) {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `❌ Kon zoekopdrachten niet ophalen van GitHub (HTTP ${status}). Controleer <code>GITHUB_TOKEN</code> en <code>GITHUB_REPO</code>.`
+        );
+        return new Response("OK", { status: 200 });
+      }
 
       if (!nr || nr < 1 || nr > regels.length) {
         await stuurBericht(env.TELEGRAM_TOKEN, chatId, "Geef een geldig nummer op uit <code>/lijst</code> (bijv. <code>/verwijder 1</code>).");
@@ -82,7 +118,16 @@ export default {
       }
 
       const verwijderd = regels.splice(nr - 1, 1)[0];
-      await slaBestandOp(env, regels, sha, "Verwijder zoekopdracht via Telegram");
+      const opgeslagen = await slaBestandOp(env, regels, sha, "Verwijder zoekopdracht via Telegram");
+      if (!opgeslagen.ok) {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `❌ Verwijderen mislukt op GitHub (HTTP ${opgeslagen.status}). Controleer de schrijfrechten van je <code>GITHUB_TOKEN</code>.`
+        );
+        return new Response("OK", { status: 200 });
+      }
+
       await stuurBericht(env.TELEGRAM_TOKEN, chatId, `🗑️ Verwijderd:\n${maakLeesbareNaam(verwijderd)}`);
       return new Response("OK", { status: 200 });
     }
@@ -101,7 +146,7 @@ export default {
         await stuurBericht(
           env.TELEGRAM_TOKEN,
           chatId,
-          `Kies de maximale afstand voor:\n${ruweUrl}`,
+          `Kies de maximale afstand voor:\n${escapeHtml(ruweUrl)}`,
           {
             inline_keyboard: [
               [
@@ -124,11 +169,45 @@ export default {
     await stuurBericht(
       env.TELEGRAM_TOKEN,
       chatId,
-      "Stuur een Marktplaats zoek- of categorielink om toe te voegen, of gebruik <code>/lijst</code> en <code>/verwijder [nummer]</code>."
+      "👋 <b>Marktplaats Alert Bot</b>\n\n" +
+        "• Plak een Marktplaats zoek- of categorielink (<code>/q/...</code> of <code>/l/...</code>) om een alert in te stellen.\n" +
+        "• Gebruik <code>/lijst</code> om je actieve zoekopdrachten te bekijken.\n" +
+        "• Gebruik <code>/verwijder [nummer]</code> om een zoekopdracht te verwijderen."
     );
     return new Response("OK", { status: 200 });
   },
 };
+
+async function maakSecretToken(telegramToken) {
+  const bytes = new TextEncoder().encode(`mp-webhook:${telegramToken}`);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function escapeHtml(tekst) {
+  return String(tekst)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function base64DecodeUtf8(base64) {
+  const binString = atob(base64.replace(/\s/g, ""));
+  const bytes = Uint8Array.from(binString, (m) => m.codePointAt(0));
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+function base64EncodeUtf8(tekst) {
+  const bytes = new TextEncoder().encode(tekst);
+  let binString = "";
+  for (const byte of bytes) {
+    binString += String.fromCharCode(byte);
+  }
+  return btoa(binString);
+}
 
 function pasAfstandToe(rawUrl, km, standaardPostcode) {
   const urlObj = new URL(rawUrl);
@@ -146,7 +225,7 @@ function pasAfstandToe(rawUrl, km, standaardPostcode) {
   if (km > 0) {
     filters.set("distanceMeters", String(km * 1000));
     if (!filters.has("postcode") && standaardPostcode) {
-      filters.set("postcode", standaardPostcode.trim().replace(/\s+/g, ""));
+      filters.set("postcode", standaardPostcode.trim().replace(/\s+/g, "").toUpperCase());
     }
   } else {
     filters.delete("distanceMeters");
@@ -161,38 +240,52 @@ function pasAfstandToe(rawUrl, km, standaardPostcode) {
 }
 
 function maakLeesbareNaam(regel) {
-  const urlDeel = regel.includes("|") && !regel.startsWith("http")
+  const heeftEigenNaam = regel.includes("|") && !regel.startsWith("http");
+  const eigenNaam = heeftEigenNaam ? regel.split("|", 2)[0].trim() : "";
+  const urlDeel = heeftEigenNaam
     ? regel.split("|", 2)[1].trim()
     : regel.trim();
 
   try {
     const u = new URL(urlDeel);
     const segmenten = u.pathname.split("/").filter((s) => s && s !== "q" && s !== "l");
-    let titel = segmenten.length
+    let titel = eigenNaam || (segmenten.length
       ? decodeURIComponent(segmenten[segmenten.length - 1]).replace(/[+-]+/g, " ")
-      : urlDeel;
+      : urlDeel);
 
     const hashQ = u.hash.match(/(?:^|#|\|)q:([^|]+)/);
-    if (hashQ) {
+    if (hashQ && !eigenNaam) {
       const zoekwoord = decodeURIComponent(hashQ[1]).replace(/[+-]+/g, " ");
       titel = `${zoekwoord} (${titel})`;
     }
 
     const kmMatch = u.hash.match(/distanceMeters:(\d+)/);
     const afstand = kmMatch ? ` (${Math.round(parseInt(kmMatch[1], 10) / 1000)} km)` : " (heel NL)";
-    return `${titel}${afstand}`.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return escapeHtml(`${titel}${afstand}`);
   } catch {
-    return urlDeel;
+    return escapeHtml(eigenNaam || urlDeel);
   }
 }
 
 async function voegZoekopdrachtToe(env, url) {
-  const { regels, sha } = await haalBestandOp(env);
-  if (regels.includes(url)) {
+  const { regels, sha, ok, status } = await haalBestandOp(env);
+  if (!ok) {
+    return `❌ Kon zoekopdrachten niet ophalen van GitHub (HTTP ${status}). Controleer <code>GITHUB_TOKEN</code> en <code>GITHUB_REPO</code>.`;
+  }
+
+  const bestaatAl = regels.some((r) => {
+    const rUrl = r.includes("|") && !r.startsWith("http") ? r.split("|", 2)[1].trim() : r;
+    return rUrl === url;
+  });
+  if (bestaatAl) {
     return "ℹ️ Deze zoekopdracht staat al in je lijst.";
   }
+
   regels.push(url);
-  await slaBestandOp(env, regels, sha, "Nieuwe zoekopdracht via Telegram");
+  const opgeslagen = await slaBestandOp(env, regels, sha, "Nieuwe zoekopdracht via Telegram");
+  if (!opgeslagen.ok) {
+    return `❌ Kon zoekopdracht niet opslaan op GitHub (HTTP ${opgeslagen.status}). Controleer de schrijfrechten van je <code>GITHUB_TOKEN</code>.`;
+  }
   return `✅ Toegevoegd:\n<b>${maakLeesbareNaam(url)}</b>`;
 }
 
@@ -206,22 +299,28 @@ async function haalBestandOp(env) {
     },
   });
 
-  if (!resp.ok) return { regels: [], sha: null };
+  if (resp.status === 404) {
+    return { regels: [], sha: null, ok: true, status: 404 };
+  }
+  if (!resp.ok) {
+    return { regels: [], sha: null, ok: false, status: resp.status };
+  }
+
   const data = await resp.json();
-  const inhoud = atob(data.content.replace(/\n/g, ""));
+  const inhoud = base64DecodeUtf8(data.content);
   const regels = inhoud
     .split("\n")
     .map((r) => r.trim())
     .filter((r) => r && !r.startsWith("#"));
 
-  return { regels, sha: data.sha };
+  return { regels, sha: data.sha, ok: true, status: 200 };
 }
 
 async function slaBestandOp(env, regels, sha, commitMsg) {
   const apiUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/contents/zoekopdrachten.txt`;
-  const nieuweInhoud = btoa(regels.join("\n") + "\n");
+  const nieuweInhoud = base64EncodeUtf8(regels.length > 0 ? regels.join("\n") + "\n" : "");
 
-  await fetch(apiUrl, {
+  const resp = await fetch(apiUrl, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${env.GITHUB_TOKEN}`,
@@ -235,6 +334,8 @@ async function slaBestandOp(env, regels, sha, commitMsg) {
       ...(sha ? { sha } : {}),
     }),
   });
+
+  return { ok: resp.ok, status: resp.status };
 }
 
 async function stuurBericht(token, chatId, text, replyMarkup = null) {
