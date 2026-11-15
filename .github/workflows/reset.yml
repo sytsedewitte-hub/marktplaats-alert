@@ -1,0 +1,26 @@
+name: Reset lijsten (eenmalig na Fork)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Maak lijsten leeg
+        run: |
+          : > zoekopdrachten.txt
+          echo "{}" > geziene_advertenties.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add zoekopdrachten.txt geziene_advertenties.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Reset zoekopdrachten en geziene advertenties"
+            git push
+          fi

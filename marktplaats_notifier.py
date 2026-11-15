@@ -18,6 +18,7 @@ HEADERS = {
     "Accept-Language": "nl-NL,nl;q=0.9",
 }
 
+MAX_OPGESLAGEN_IDS = 250
 telegram_bereikbaar = True
 
 
@@ -53,13 +54,20 @@ def stuur_telegram(tekst, parse_mode="HTML"):
 
 
 def bedenk_naam(url):
-    pad = unquote(urlparse(url).path).strip("/")
+    parsed = urlparse(url)
+    pad = unquote(parsed.path).strip("/")
     segmenten = [s for s in pad.split("/") if s and s not in ("q", "l")]
-    if segmenten:
-        naam = re.sub(r"[+-]+", " ", segmenten[-1]).strip().title()
-        if naam:
-            return naam
-    return "Marktplaats Zoekopdracht"
+    titel = re.sub(r"[+-]+", " ", segmenten[-1]).strip().title() if segmenten else ""
+
+    zoekwoord = ""
+    for deel in parsed.fragment.replace("#", "|").split("|"):
+        if deel.startswith("q:"):
+            zoekwoord = re.sub(r"[+-]+", " ", unquote(deel[2:])).strip().title()
+            break
+
+    if zoekwoord and titel and zoekwoord.lower() != titel.lower():
+        return f"{zoekwoord} ({titel})"
+    return zoekwoord or titel or "Marktplaats Zoekopdracht"
 
 
 def haal_id_nummer(ad_id):
@@ -109,6 +117,7 @@ def haal_advertenties_op(url):
         "viewOptions": "list-view",
     }
     attributes = []
+    ranges = {}
 
     resp = requests.get(basis_url, headers=HEADERS, timeout=10)
     resp.raise_for_status()
@@ -165,6 +174,19 @@ def haal_advertenties_op(url):
                     if k and v:
                         attributes.append(f"{k}:{v}")
 
+            for r in search_req.get("attributeRanges", []):
+                if isinstance(r, str) and r.count(":") == 2:
+                    rk, r_from, r_to = r.split(":")
+                    if rk:
+                        ranges[rk] = {"from": r_from, "to": r_to}
+                elif isinstance(r, dict):
+                    rk = r.get("attributeKey") or r.get("key")
+                    if rk:
+                        ranges[rk] = {
+                            "from": r.get("from") if r.get("from") is not None else "null",
+                            "to": r.get("to") if r.get("to") is not None else "null",
+                        }
+
             fallback_listings = srar.get("listings", [])
         except Exception as e:
             log(f"    [Debug] Fout bij uitlezen __NEXT_DATA__: {e}")
@@ -199,6 +221,16 @@ def haal_advertenties_op(url):
             api_params["postcode"] = unquote(v).replace(" ", "").upper()
         elif k == "distanceMeters":
             api_params["distanceMeters"] = v
+        elif k == "l1CategoryId" and v.split(",")[0].isdigit():
+            api_params["l1CategoryId"] = int(v.split(",")[0])
+        elif k == "l2CategoryIds":
+            l2_ids = [int(x) for x in v.split(",") if x.strip().isdigit()]
+            if l2_ids:
+                api_params["l2CategoryIds[]"] = l2_ids
+        elif k.endswith("From") and len(k) > 4:
+            ranges.setdefault(k[:-4], {})["from"] = v
+        elif k.endswith("To") and len(k) > 2:
+            ranges.setdefault(k[:-2], {})["to"] = v
         else:
             attributes.append(f"{k}:{v}")
 
@@ -207,6 +239,12 @@ def haal_advertenties_op(url):
 
     if attributes:
         api_params["attributesByKey[]"] = list(dict.fromkeys(attributes))
+
+    if ranges:
+        api_params["attributeRanges[]"] = [
+            f"{rk}:{vals.get('from') or 'null'}:{vals.get('to') or 'null'}"
+            for rk, vals in ranges.items()
+        ]
 
     api_headers = {**HEADERS, "Accept": "application/json", "Referer": basis_url}
     try:
@@ -219,7 +257,7 @@ def haal_advertenties_op(url):
         api_resp.raise_for_status()
         listings = api_resp.json().get("listings", []) if api_resp.text.strip() else []
     except Exception as e:
-        if "postcode" not in api_params and not attributes and fallback_listings:
+        if "postcode" not in api_params and not attributes and not ranges and fallback_listings:
             log(f"    [Debug] API fout ({e}), gebruik fallback_listings.")
             listings = fallback_listings
         else:
@@ -246,10 +284,20 @@ log("Start Marktplaats controle...")
 
 db = {}
 if os.path.exists(DB_FILE):
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        ruwe_data = json.load(f)
-        if isinstance(ruwe_data, dict) and "urls" not in ruwe_data:
-            db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
+    try:
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            ruwe_data = json.load(f)
+            if isinstance(ruwe_data, dict) and "urls" not in ruwe_data:
+                db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
+    except Exception as e:
+        log(f"⚠️ Kon {DB_FILE} niet lezen ({e}), start met lege database.")
+
+alle_bekende_nummers = [haal_id_nummer(i) for ids in db.values() for i in ids]
+globaal_hoogste_id = max(alle_bekende_nummers) if alle_bekende_nummers else 0
+
+if not os.path.exists(URLS_FILE):
+    with open(URLS_FILE, "w", encoding="utf-8") as f:
+        f.write("")
 
 with open(URLS_FILE, "r", encoding="utf-8") as f:
     regels = [r.strip() for r in f if r.strip() and not r.strip().startswith("#")]
@@ -265,9 +313,9 @@ for regel in regels:
         naam, url = bedenk_naam(regel), regel
 
     is_nieuwe_url = url not in db
-    geziene_ids = db.get(url, set())
+    geziene_ids = set(db.get(url, set()))
     bestaande_nummers = [haal_id_nummer(i) for i in geziene_ids]
-    hoogste_bekende_id = max(bestaande_nummers) if bestaande_nummers else 0
+    hoogste_bekende_id = max(bestaande_nummers) if bestaande_nummers else globaal_hoogste_id
 
     log(f"Controleren: {naam} (eerste keer: {is_nieuwe_url})")
 
@@ -277,7 +325,7 @@ for regel in regels:
     except Exception as e:
         log(f" -> Fout bij ophalen van {naam}: {e}")
         if not is_nieuwe_url:
-            nieuwe_db[url] = sorted(geziene_ids)
+            nieuwe_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
         continue
 
     nieuwe_ids_aantal = 0
@@ -312,7 +360,7 @@ for regel in regels:
             )
             stuur_telegram(telegram_bericht)
 
-    nieuwe_db[url] = sorted(geziene_ids)
+    nieuwe_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
     log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
     time.sleep(1)
 
