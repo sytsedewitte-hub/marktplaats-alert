@@ -9,6 +9,7 @@ Ontvang automatisch een Telegram-bericht bij nieuwe Marktplaats-advertenties en 
 * **Slimme filtering:** Negeert reclames (Admarkt), dubbele meldingen en oude advertenties die omhoog zijn geplaatst.
 * **Snel beheer via Telegram:** Plak een link en kies de straal (**30 t/m 125 km** of **Heel NL**), bekijk je lijst met `/lijst` of verwijder via `/verwijder [nummer]`.
 * **Geen opstart-spam:** Bij een nieuwe zoekopdracht worden bestaande advertenties (tot 100) stil opgeslagen.
+* **Privacyvriendelijk:** Je zoekopdrachten, postcode en geziene advertenties worden automatisch versleuteld opgeslagen met jouw eigen `TELEGRAM_TOKEN`.
 
 ---
 
