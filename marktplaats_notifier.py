@@ -20,6 +20,7 @@ HEADERS = {
 }
 
 MAX_OPGESLAGEN_IDS = 250
+FOUT_ALERT_COOLDOWN_SEC = 6 * 3600
 telegram_bereikbaar = True
 
 
@@ -351,6 +352,7 @@ def is_nieuwe_verkoper(ad_url, seller_id=None, cache=None):
 log("Start Marktplaats controle...")
 
 db = {}
+oude_meta = {}
 if os.path.exists(DB_FILE):
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -361,6 +363,8 @@ if os.path.exists(DB_FILE):
                     if ontsleuteld_json:
                         parsed_db = json.loads(ontsleuteld_json)
                         db = {k: set(v) for k, v in parsed_db.items() if isinstance(v, list)}
+                        if isinstance(parsed_db.get("_meta"), dict):
+                            oude_meta = parsed_db["_meta"]
                 elif "urls" not in ruwe_data and "data" not in ruwe_data:
                     db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
     except Exception:
@@ -396,6 +400,10 @@ log(f"{len(regels)} zoekopdracht(en) gevonden.")
 
 nieuwe_db = {}
 verkoper_cache = {}
+aantal_gelukt = 0
+aantal_mislukt = 0
+blokkade_status = None
+laatste_fout = ""
 
 for idx, regel in enumerate(regels, start=1):
     if "|" in regel and not regel.startswith("http"):
@@ -413,8 +421,14 @@ for idx, regel in enumerate(regels, start=1):
     try:
         advertenties = haal_advertenties_op(url)
         log(f" -> {len(advertenties)} advertenties opgehaald.")
-    except Exception:
-        log(f" -> Fout bij ophalen van Zoekopdracht #{idx}.")
+        aantal_gelukt += 1
+    except Exception as e:
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if status_code in (403, 429):
+            blokkade_status = status_code
+        laatste_fout = f"HTTP {status_code}" if status_code else type(e).__name__
+        aantal_mislukt += 1
+        log(f" -> Fout bij ophalen van Zoekopdracht #{idx} ({laatste_fout}).")
         if not is_nieuwe_url:
             nieuwe_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
         continue
@@ -466,13 +480,45 @@ for idx, regel in enumerate(regels, start=1):
         log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
     time.sleep(1)
 
+nu = int(time.time())
+nieuw_meta = dict(oude_meta)
+
+if regels and aantal_mislukt > 0 and (blokkade_status is not None or aantal_gelukt == 0):
+    fouten_op_rij = int(nieuw_meta.get("fouten_op_rij", 0)) + 1
+    nieuw_meta["fouten_op_rij"] = fouten_op_rij
+    laatste_alert = int(nieuw_meta.get("laatste_fout_alert", 0))
+
+    if (blokkade_status is not None or fouten_op_rij >= 3) and (nu - laatste_alert >= FOUT_ALERT_COOLDOWN_SEC):
+        if blokkade_status is not None:
+            reden = f"Marktplaats blokkeert de requests mogelijk (HTTP {blokkade_status})."
+        else:
+            reden = f"Ophalen mislukt al {fouten_op_rij} keer op rij ({laatste_fout})."
+        stuur_telegram(
+            f"⚠️ <b>Marktplaats Alert waarschuwing</b>\n"
+            f"{html.escape(reden)}\n"
+            f"{aantal_mislukt} van de {len(regels)} zoekopdracht(en) mislukt."
+        )
+        nieuw_meta["laatste_fout_alert"] = nu
+elif aantal_gelukt > 0 and blokkade_status is None:
+    nieuw_meta.pop("fouten_op_rij", None)
+    if nu - int(nieuw_meta.get("laatste_fout_alert", 0)) > 24 * 3600:
+        nieuw_meta.pop("laatste_fout_alert", None)
+
 oude_db_genormaliseerd = {
     k: sorted(v, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
     for k, v in db.items()
 }
 
-if nieuwe_db != oude_db_genormaliseerd or not os.path.exists(DB_FILE):
-    versleutelde_db = {"data": versleutel(json.dumps(nieuwe_db), TOKEN)} if nieuwe_db else {}
+oude_payload = {**oude_db_genormaliseerd}
+if oude_meta:
+    oude_payload["_meta"] = oude_meta
+
+nieuwe_payload = {**nieuwe_db}
+if nieuw_meta:
+    nieuwe_payload["_meta"] = nieuw_meta
+
+if nieuwe_payload != oude_payload or not os.path.exists(DB_FILE):
+    versleutelde_db = {"data": versleutel(json.dumps(nieuwe_payload), TOKEN)} if nieuwe_payload else {}
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(versleutelde_db, f, indent=2)
     log("Klaar! Database versleuteld opgeslagen.")
