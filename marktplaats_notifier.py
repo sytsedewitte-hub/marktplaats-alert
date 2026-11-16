@@ -366,7 +366,8 @@ if os.path.exists(DB_FILE):
     except Exception:
         log(f"⚠️ Kon {DB_FILE} niet lezen, start met lege database.")
 
-alle_bekende_nummers = [haal_id_nummer(i) for ids in db.values() for i in ids]
+alle_bekende_ids = {i for ids in db.values() for i in ids}
+alle_bekende_nummers = [haal_id_nummer(i) for i in alle_bekende_ids]
 globaal_hoogste_id = max(alle_bekende_nummers) if alle_bekende_nummers else 0
 
 if not os.path.exists(URLS_FILE):
@@ -431,7 +432,13 @@ for idx, regel in enumerate(regels, start=1):
         ad_nummer = haal_id_nummer(ad["id"])
 
         if is_nieuwe_url:
+            alle_bekende_ids.add(ad["id"])
             continue
+
+        if ad["id"] in alle_bekende_ids:
+            continue
+
+        alle_bekende_ids.add(ad["id"])
 
         if ad["datum"].lower() != "vandaag" or ad_nummer <= hoogste_bekende_id:
             continue
@@ -459,8 +466,15 @@ for idx, regel in enumerate(regels, start=1):
         log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
     time.sleep(1)
 
-versleutelde_db = {"data": versleutel(json.dumps(nieuwe_db), TOKEN)} if nieuwe_db else {}
-with open(DB_FILE, "w", encoding="utf-8") as f:
-    json.dump(versleutelde_db, f, indent=2)
+oude_db_genormaliseerd = {
+    k: sorted(v, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
+    for k, v in db.items()
+}
 
-log("Klaar! Database versleuteld opgeslagen.")
+if nieuwe_db != oude_db_genormaliseerd or not os.path.exists(DB_FILE):
+    versleutelde_db = {"data": versleutel(json.dumps(nieuwe_db), TOKEN)} if nieuwe_db else {}
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(versleutelde_db, f, indent=2)
+    log("Klaar! Database versleuteld opgeslagen.")
+else:
+    log("Klaar! Geen wijzigingen in database.")
