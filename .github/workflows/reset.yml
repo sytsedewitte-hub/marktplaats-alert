@@ -17,9 +17,10 @@ jobs:
         run: |
           : > zoekopdrachten.txt
           echo "{}" > geziene_advertenties.json
+          echo "{}" > gebruikers.json
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add zoekopdrachten.txt geziene_advertenties.json
+          git add zoekopdrachten.txt geziene_advertenties.json gebruikers.json
           if ! git diff --cached --quiet; then
             git commit -m "Reset zoekopdrachten en geziene advertenties"
             git push
