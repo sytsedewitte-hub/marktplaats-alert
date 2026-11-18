@@ -48,8 +48,12 @@ export default {
     if (update.callback_query) {
       const cq = update.callback_query;
       const chatId = String(cq.message?.chat?.id || "");
-      if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
-        return new Response("Unauthorized", { status: 403 });
+      const eigenaar = isEigenaar(env, chatId);
+      const gebruikersData = eigenaar ? null : await haalGebruikersOp(env);
+
+      if (!eigenaar && (!gebruikersData.ok || !gebruikersData.data.users?.[chatId])) {
+        await beantwoordCallback(env.TELEGRAM_TOKEN, cq.id);
+        return new Response("OK", { status: 200 });
       }
 
       const kmMatch = (cq.data || "").match(/^km:(\d+)$/);
@@ -57,8 +61,15 @@ export default {
 
       if (kmMatch && urlMatch) {
         const km = parseInt(kmMatch[1], 10);
-        const definitieveUrl = pasAfstandToe(urlMatch[0], km, env.STANDAARD_POSTCODE);
-        const resultaat = await voegZoekopdrachtToe(env, definitieveUrl);
+        const gData = gebruikersData || (await haalGebruikersOp(env));
+        const userPostcode = gData.ok ? gData.data.users?.[chatId]?.postcode : "";
+        const gebruiktePostcode = userPostcode || env.STANDAARD_POSTCODE;
+        const definitieveUrl = pasAfstandToe(urlMatch[0], km, gebruiktePostcode);
+        let resultaat = await voegZoekopdrachtToe(env, chatId, definitieveUrl);
+
+        if (km > 0 && !userPostcode && !eigenaar && resultaat.startsWith("✅")) {
+          resultaat += "\n\n💡 <i>Tip: stel je eigen postcode in met <code>/postcode 1234AB</code></i>";
+        }
 
         await beantwoordCallback(env.TELEGRAM_TOKEN, cq.id);
         await bewerkBericht(env.TELEGRAM_TOKEN, chatId, cq.message.message_id, resultaat);
@@ -72,15 +83,242 @@ export default {
     }
 
     const chatId = String(msg.chat.id);
-    if (chatId !== String(env.TELEGRAM_CHAT_ID)) {
-      return new Response("Unauthorized", { status: 403 });
+    const tekst = msg.text.trim();
+    const eigenaar = isEigenaar(env, chatId);
+
+    // 2. /start (ook voor uitnodigingslinks: /start <code>)
+    if (tekst === "/start" || tekst.startsWith("/start ")) {
+      const code = tekst.slice(6).trim();
+      const gebruikersRes = await haalGebruikersOp(env);
+      const isAlLid = eigenaar || Boolean(gebruikersRes.ok && gebruikersRes.data.users?.[chatId]);
+
+      if (!isAlLid) {
+        if (!gebruikersRes.ok) {
+          await stuurBericht(env.TELEGRAM_TOKEN, chatId, "❌ Er ging iets mis bij het controleren van je toegang.");
+          return new Response("OK", { status: 200 });
+        }
+
+        const geldigeCode = (env.INVITE_CODE || "").trim() || gebruikersRes.data._invite_code || "";
+        if (!code || !geldigeCode || code !== geldigeCode) {
+          await stuurBericht(
+            env.TELEGRAM_TOKEN,
+            chatId,
+            "🔒 Deze bot is privé. Vraag de eigenaar om een geldige uitnodigingslink."
+          );
+          return new Response("OK", { status: 200 });
+        }
+
+        const naam =
+          [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ") ||
+          msg.from?.username ||
+          `Gebruiker ${chatId}`;
+
+        const data = gebruikersRes.data;
+        if (!data.users) data.users = {};
+        data.users[chatId] = {
+          naam,
+          postcode: "",
+          zoekopdrachten: [],
+        };
+
+        const opgeslagen = await slaGebruikersOp(env, data, gebruikersRes.sha, `Nieuwe gebruiker aangemeld: ${naam}`);
+        if (!opgeslagen.ok) {
+          await stuurBericht(env.TELEGRAM_TOKEN, chatId, "❌ Aanmelden mislukt. Probeer het later opnieuw.");
+          return new Response("OK", { status: 200 });
+        }
+
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `👋 Welkom <b>${escapeHtml(naam)}</b>!\n\n` +
+            "Je hebt nu toegang tot de Marktplaats Alert Bot:\n" +
+            "1. Stel optioneel je postcode in met <code>/postcode 1234AB</code>\n" +
+            "2. Plak een Marktplaats zoek- of categorielink (<code>/q/...</code> of <code>/l/...</code>)\n" +
+            "3. Gebruik <code>/lijst</code> en <code>/verwijder [nummer]</code> om je zoekopdrachten te beheren."
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      await stuurHelpBericht(env.TELEGRAM_TOKEN, chatId, eigenaar);
+      return new Response("OK", { status: 200 });
     }
 
-    const tekst = msg.text.trim();
+    // Controleer toegang voor alle overige berichten
+    const gebruikersRes = await haalGebruikersOp(env);
+    const isGeregistreerd = Boolean(gebruikersRes.ok && gebruikersRes.data.users?.[chatId]);
+    if (!eigenaar && !isGeregistreerd) {
+      await stuurBericht(
+        env.TELEGRAM_TOKEN,
+        chatId,
+        "🔒 Deze bot is privé. Vraag de eigenaar om een uitnodigingslink."
+      );
+      return new Response("OK", { status: 200 });
+    }
 
-    // 2. Commando: /lijst
+    // 3. Beheerderscommando's (alleen eigenaar)
+    if (eigenaar && (tekst === "/uitnodiging" || tekst === "/uitnodiging nieuw")) {
+      if (!gebruikersRes.ok) {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `❌ Kon gegevens niet ophalen van GitHub (HTTP ${gebruikersRes.status}).`
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      const forceerNieuw = tekst === "/uitnodiging nieuw";
+      let code = (env.INVITE_CODE || "").trim();
+      if (!code) {
+        if (forceerNieuw || !gebruikersRes.data._invite_code) {
+          code = genereerUitnodigingscode();
+          gebruikersRes.data._invite_code = code;
+          const opgeslagen = await slaGebruikersOp(
+            env,
+            gebruikersRes.data,
+            gebruikersRes.sha,
+            "Genereer uitnodigingscode"
+          );
+          if (!opgeslagen.ok) {
+            await stuurBericht(
+              env.TELEGRAM_TOKEN,
+              chatId,
+              `❌ Kon uitnodigingscode niet opslaan op GitHub (HTTP ${opgeslagen.status}).`
+            );
+            return new Response("OK", { status: 200 });
+          }
+        } else {
+          code = gebruikersRes.data._invite_code;
+        }
+      }
+
+      const botUsername = await haalBotUsernameOp(env.TELEGRAM_TOKEN);
+      if (botUsername) {
+        const link = `https://t.me/${botUsername}?start=${code}`;
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `🔗 <b>Uitnodigingslink voor je broertje/vrienden:</b>\n\n${escapeHtml(link)}\n\n` +
+            (env.INVITE_CODE
+              ? "Deel deze link; na klikken op <b>Start</b> is toegang direct actief."
+              : "Deel deze link; na klikken op <b>Start</b> is toegang direct actief.\nNieuwe code maken? Gebruik <code>/uitnodiging nieuw</code>.")
+        );
+      } else {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `🔑 <b>Uitnodigingscode:</b> <code>${escapeHtml(code)}</code>\nLaat de ander naar de bot gaan en sturen: <code>/start ${escapeHtml(code)}</code>`
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (eigenaar && tekst === "/gebruikers") {
+      if (!gebruikersRes.ok) {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `❌ Kon gebruikers niet ophalen (HTTP ${gebruikersRes.status}).`
+        );
+        return new Response("OK", { status: 200 });
+      }
+      const leden = Object.entries(gebruikersRes.data.users || {}).filter(([id]) => id !== String(env.TELEGRAM_CHAT_ID));
+      if (leden.length === 0) {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          "Er zijn nog geen extra gebruikers aangemeld. Gebruik <code>/uitnodiging</code> om een link te maken."
+        );
+      } else {
+        const overzicht = leden
+          .map(([id, u], i) => {
+            const aantal = (u.zoekopdrachten || []).length;
+            const pc = u.postcode || "standaard";
+            return `${i + 1}. <b>${escapeHtml(u.naam || id)}</b> (${aantal} zoekopdracht${aantal === 1 ? "" : "en"}, postcode: ${escapeHtml(pc)})`;
+          })
+          .join("\n");
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `👥 <b>Aangemelde gebruikers:</b>\n\n${overzicht}\n\nVerwijderen met: <code>/verwijder_gebruiker nummer</code>`
+        );
+      }
+      return new Response("OK", { status: 200 });
+    }
+
+    if (eigenaar && tekst.startsWith("/verwijder_gebruiker")) {
+      const nr = parseInt(tekst.replace("/verwijder_gebruiker", "").trim(), 10);
+      if (!gebruikersRes.ok) {
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `❌ Kon gebruikers niet ophalen (HTTP ${gebruikersRes.status}).`
+        );
+        return new Response("OK", { status: 200 });
+      }
+      const leden = Object.entries(gebruikersRes.data.users || {}).filter(([id]) => id !== String(env.TELEGRAM_CHAT_ID));
+      if (!nr || nr < 1 || nr > leden.length) {
+        await stuurBericht(env.TELEGRAM_TOKEN, chatId, "Geef een geldig nummer op uit <code>/gebruikers</code>.");
+        return new Response("OK", { status: 200 });
+      }
+      const [verwijderId, verwijderInfo] = leden[nr - 1];
+      delete gebruikersRes.data.users[verwijderId];
+      const opgeslagen = await slaGebruikersOp(
+        env,
+        gebruikersRes.data,
+        gebruikersRes.sha,
+        `Verwijder gebruiker ${verwijderInfo.naam || verwijderId}`
+      );
+      if (!opgeslagen.ok) {
+        await stuurBericht(env.TELEGRAM_TOKEN, chatId, `❌ Verwijderen mislukt (HTTP ${opgeslagen.status}).`);
+        return new Response("OK", { status: 200 });
+      }
+      await stuurBericht(
+        env.TELEGRAM_TOKEN,
+        chatId,
+        `🗑️ Gebruiker <b>${escapeHtml(verwijderInfo.naam || verwijderId)}</b> verwijderd.`
+      );
+      return new Response("OK", { status: 200 });
+    }
+
+    // 4. Commando: /postcode <1234AB>
+    if (tekst === "/postcode" || tekst.startsWith("/postcode ")) {
+      const invoer = tekst.replace("/postcode", "").trim().replace(/\s+/g, "").toUpperCase();
+      if (!/^[1-9][0-9]{3}[A-Z]{2}$/.test(invoer)) {
+        const huidige = (gebruikersRes.ok && gebruikersRes.data.users?.[chatId]?.postcode) || (eigenaar ? env.STANDAARD_POSTCODE : "");
+        await stuurBericht(
+          env.TELEGRAM_TOKEN,
+          chatId,
+          `📍 Geef een geldige Nederlandse postcode op, bijv. <code>/postcode 1234AB</code>.` +
+            (huidige ? `\nHuidige postcode: <code>${escapeHtml(huidige)}</code>` : "")
+        );
+        return new Response("OK", { status: 200 });
+      }
+
+      if (!gebruikersRes.ok) {
+        await stuurBericht(env.TELEGRAM_TOKEN, chatId, `❌ Kon gegevens niet ophalen (HTTP ${gebruikersRes.status}).`);
+        return new Response("OK", { status: 200 });
+      }
+
+      if (!gebruikersRes.data.users) gebruikersRes.data.users = {};
+      if (!gebruikersRes.data.users[chatId]) {
+        gebruikersRes.data.users[chatId] = { naam: eigenaar ? "Eigenaar" : chatId, postcode: invoer, zoekopdrachten: [] };
+      } else {
+        gebruikersRes.data.users[chatId].postcode = invoer;
+      }
+
+      const opgeslagen = await slaGebruikersOp(env, gebruikersRes.data, gebruikersRes.sha, "Postcode bijgewerkt via Telegram");
+      if (!opgeslagen.ok) {
+        await stuurBericht(env.TELEGRAM_TOKEN, chatId, `❌ Opslaan mislukt (HTTP ${opgeslagen.status}).`);
+        return new Response("OK", { status: 200 });
+      }
+
+      await stuurBericht(env.TELEGRAM_TOKEN, chatId, `📍 Je standaard postcode is nu ingesteld op <b>${escapeHtml(invoer)}</b>.`);
+      return new Response("OK", { status: 200 });
+    }
+
+    // 5. Commando: /lijst
     if (tekst === "/lijst") {
-      const { regels, ok, status } = await haalBestandOp(env);
+      const { regels, ok, status } = await haalZoekopdrachtenOp(env, chatId);
       if (!ok) {
         await stuurBericht(
           env.TELEGRAM_TOKEN,
@@ -98,10 +336,10 @@ export default {
       return new Response("OK", { status: 200 });
     }
 
-    // 3. Commando: /verwijder <nummer>
+    // 6. Commando: /verwijder <nummer>
     if (tekst.startsWith("/verwijder")) {
       const nr = parseInt(tekst.replace("/verwijder", "").trim(), 10);
-      const { regels, sha, ok, status } = await haalBestandOp(env);
+      const { regels, sha, gebruikersData, ok, status } = await haalZoekopdrachtenOp(env, chatId);
 
       if (!ok) {
         await stuurBericht(
@@ -118,7 +356,14 @@ export default {
       }
 
       const verwijderd = regels.splice(nr - 1, 1)[0];
-      const opgeslagen = await slaBestandOp(env, regels, sha, "Verwijder zoekopdracht via Telegram");
+      const opgeslagen = await slaZoekopdrachtenOp(
+        env,
+        chatId,
+        regels,
+        sha,
+        gebruikersData,
+        "Verwijder zoekopdracht via Telegram"
+      );
       if (!opgeslagen.ok) {
         await stuurBericht(
           env.TELEGRAM_TOKEN,
@@ -132,15 +377,16 @@ export default {
       return new Response("OK", { status: 200 });
     }
 
-    // 4. Nieuwe Marktplaats zoek- of categorielink ontvangen (alleen /l/ of /q/)
+    // 7. Nieuwe Marktplaats zoek- of categorielink ontvangen (alleen /l/ of /q/)
     const mpMatch = tekst.match(/(https?:\/\/(?:www\.)?marktplaats\.nl\/(?:l|q)\/\S+)(?:\s+(\d+))?/i);
     if (mpMatch) {
       const ruweUrl = mpMatch[1];
       const directKm = mpMatch[2];
 
       if (directKm !== undefined) {
-        const definitieveUrl = pasAfstandToe(ruweUrl, parseInt(directKm, 10), env.STANDAARD_POSTCODE);
-        const resultaat = await voegZoekopdrachtToe(env, definitieveUrl);
+        const userPostcode = gebruikersRes.ok ? gebruikersRes.data.users?.[chatId]?.postcode : "";
+        const definitieveUrl = pasAfstandToe(ruweUrl, parseInt(directKm, 10), userPostcode || env.STANDAARD_POSTCODE);
+        const resultaat = await voegZoekopdrachtToe(env, chatId, definitieveUrl);
         await stuurBericht(env.TELEGRAM_TOKEN, chatId, resultaat);
       } else {
         await stuurBericht(
@@ -166,14 +412,7 @@ export default {
       return new Response("OK", { status: 200 });
     }
 
-    await stuurBericht(
-      env.TELEGRAM_TOKEN,
-      chatId,
-      "👋 <b>Marktplaats Alert Bot</b>\n\n" +
-        "• Plak een Marktplaats zoek- of categorielink (<code>/q/...</code> of <code>/l/...</code>) om een alert in te stellen.\n" +
-        "• Gebruik <code>/lijst</code> om je actieve zoekopdrachten te bekijken.\n" +
-        "• Gebruik <code>/verwijder [nummer]</code> om een zoekopdracht te verwijderen."
-    );
+    await stuurHelpBericht(env.TELEGRAM_TOKEN, chatId, eigenaar);
     return new Response("OK", { status: 200 });
   },
 };
@@ -267,8 +506,78 @@ function maakLeesbareNaam(regel) {
   }
 }
 
-async function voegZoekopdrachtToe(env, url) {
-  const { regels, sha, ok, status } = await haalBestandOp(env);
+function isEigenaar(env, chatId) {
+  return String(chatId) === String(env.TELEGRAM_CHAT_ID);
+}
+
+function genereerUitnodigingscode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(9));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function haalBotUsernameOp(token) {
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const data = await resp.json();
+    return data.ok ? data.result?.username || "" : "";
+  } catch {
+    return "";
+  }
+}
+
+async function stuurHelpBericht(token, chatId, eigenaar) {
+  let tekst =
+    "👋 <b>Marktplaats Alert Bot</b>\n\n" +
+    "• Plak een Marktplaats zoek- of categorielink (<code>/q/...</code> of <code>/l/...</code>) om een alert in te stellen.\n" +
+    "• Gebruik <code>/lijst</code> om je actieve zoekopdrachten te bekijken.\n" +
+    "• Gebruik <code>/verwijder [nummer]</code> om een zoekopdracht te verwijderen.\n" +
+    "• Gebruik <code>/postcode 1234AB</code> om je eigen postcode in te stellen.";
+
+  if (eigenaar) {
+    tekst +=
+      "\n\n<b>Beheerder:</b>\n" +
+      "• <code>/uitnodiging</code> — maak of bekijk je uitnodigingslink\n" +
+      "• <code>/gebruikers</code> — bekijk aangemelde gebruikers\n" +
+      "• <code>/verwijder_gebruiker [nummer]</code> — verwijder een gebruiker";
+  }
+
+  await stuurBericht(token, chatId, tekst);
+}
+
+async function haalZoekopdrachtenOp(env, chatId) {
+  if (isEigenaar(env, chatId)) {
+    const res = await haalBestandOp(env);
+    return { ...res, gebruikersData: null };
+  }
+  const gRes = await haalGebruikersOp(env);
+  if (!gRes.ok) {
+    return { regels: [], sha: null, gebruikersData: null, ok: false, status: gRes.status };
+  }
+  const user = gRes.data.users?.[chatId];
+  return {
+    regels: [...(user?.zoekopdrachten || [])],
+    sha: gRes.sha,
+    gebruikersData: gRes.data,
+    ok: true,
+    status: 200,
+  };
+}
+
+async function slaZoekopdrachtenOp(env, chatId, regels, sha, gebruikersData, commitMsg) {
+  if (isEigenaar(env, chatId)) {
+    return slaBestandOp(env, regels, sha, commitMsg);
+  }
+  const data = gebruikersData || {};
+  if (!data.users) data.users = {};
+  if (!data.users[chatId]) {
+    data.users[chatId] = { naam: `Gebruiker ${chatId}`, postcode: "", zoekopdrachten: [] };
+  }
+  data.users[chatId].zoekopdrachten = regels;
+  return slaGebruikersOp(env, data, sha, commitMsg);
+}
+
+async function voegZoekopdrachtToe(env, chatId, url) {
+  const { regels, sha, gebruikersData, ok, status } = await haalZoekopdrachtenOp(env, chatId);
   if (!ok) {
     return `❌ Kon zoekopdrachten niet ophalen van GitHub (HTTP ${status}). Controleer <code>GITHUB_TOKEN</code> en <code>GITHUB_REPO</code>.`;
   }
@@ -282,7 +591,14 @@ async function voegZoekopdrachtToe(env, url) {
   }
 
   regels.push(url);
-  const opgeslagen = await slaBestandOp(env, regels, sha, "Nieuwe zoekopdracht via Telegram");
+  const opgeslagen = await slaZoekopdrachtenOp(
+    env,
+    chatId,
+    regels,
+    sha,
+    gebruikersData,
+    "Nieuwe zoekopdracht via Telegram"
+  );
   if (!opgeslagen.ok) {
     return `❌ Kon zoekopdracht niet opslaan op GitHub (HTTP ${opgeslagen.status}). Controleer de schrijfrechten van je <code>GITHUB_TOKEN</code>.`;
   }
@@ -392,6 +708,71 @@ async function slaBestandOp(env, regels, sha, commitMsg) {
     ? (await versleutel(platteTekst, env.TELEGRAM_TOKEN)) + "\n"
     : "";
   const nieuweInhoud = base64EncodeUtf8(versleuteldeTekst);
+
+  const resp = await fetch(apiUrl, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      "User-Agent": "Cloudflare-Worker",
+      Accept: "application/vnd.github.v3+json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      message: commitMsg,
+      content: nieuweInhoud,
+      ...(sha ? { sha } : {}),
+    }),
+  });
+
+  return { ok: resp.ok, status: resp.status };
+}
+
+async function haalGebruikersOp(env) {
+  const apiUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/contents/gebruikers.json`;
+  const resp = await fetch(apiUrl, {
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      "User-Agent": "Cloudflare-Worker",
+      Accept: "application/vnd.github.v3+json",
+    },
+  });
+
+  if (resp.status === 404) {
+    return { data: { users: {} }, sha: null, ok: true, status: 404 };
+  }
+  if (!resp.ok) {
+    return { data: { users: {} }, sha: null, ok: false, status: resp.status };
+  }
+
+  const fileData = await resp.json();
+  const inhoud = base64DecodeUtf8(fileData.content).trim();
+  if (!inhoud) {
+    return { data: { users: {} }, sha: fileData.sha, ok: true, status: 200 };
+  }
+
+  try {
+    const parsed = JSON.parse(inhoud);
+    if (typeof parsed.data === "string" && parsed.data.startsWith("ENC1:")) {
+      const ontsleuteld = await ontsleutel(parsed.data, env.TELEGRAM_TOKEN);
+      if (ontsleuteld !== null) {
+        const obj = JSON.parse(ontsleuteld);
+        if (!obj.users) obj.users = {};
+        return { data: obj, sha: fileData.sha, ok: true, status: 200 };
+      }
+      return { data: { users: {} }, sha: fileData.sha, ok: true, status: 200 };
+    }
+    if (!parsed.users) parsed.users = {};
+    return { data: parsed, sha: fileData.sha, ok: true, status: 200 };
+  } catch {
+    return { data: { users: {} }, sha: fileData.sha, ok: true, status: 200 };
+  }
+}
+
+async function slaGebruikersOp(env, dataObj, sha, commitMsg) {
+  const apiUrl = `https://api.github.com/repos/${env.GITHUB_REPO}/contents/gebruikers.json`;
+  const payloadJson = JSON.stringify(dataObj || { users: {} });
+  const versleuteld = await versleutel(payloadJson, env.TELEGRAM_TOKEN);
+  const nieuweInhoud = base64EncodeUtf8(JSON.stringify({ data: versleuteld }, null, 2) + "\n");
 
   const resp = await fetch(apiUrl, {
     method: "PUT",

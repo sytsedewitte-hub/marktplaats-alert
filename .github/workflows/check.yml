@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - 'zoekopdrachten.txt'
+      - 'gebruikers.json'
 
 concurrency:
   group: marktplaats-check

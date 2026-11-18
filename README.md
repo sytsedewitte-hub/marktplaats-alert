@@ -43,4 +43,11 @@ Klik op onderstaande knop en vul je gegevens in (`TELEGRAM_TOKEN`, `TELEGRAM_CHA
 2. Plak de link in je Telegram-chat met de bot en tik op de gewenste afstand.
 3. Klaar! Nieuwe advertenties komen direct binnen met prijs en directe link.
 
+### 👥 Delen met familie of vrienden (zonder GitHub/Cloudflare)
+Wil je iemand anders (bijv. je broertje) laten meedoen op jouw eigen bot?
+1. Stuur **`/uitnodiging`** naar je eigen Telegram-bot en stuur de link die je terugkrijgt door.
+2. De ander opent de link, klikt op **Start**, stelt eventueel een eigen postcode in met **`/postcode 1234AB`** en kan direct Marktplaats-links plakken.
+3. Met **`/gebruikers`** en **`/verwijder_gebruiker [nummer]`** beheer je wie toegang heeft (of maak een nieuwe link met `/uitnodiging nieuw`).
+
 *Updates binnenhalen? Klik in je eigen repository op **Sync fork**.*
+

@@ -13,6 +13,7 @@ CHAT_ID = str(os.environ["TELEGRAM_CHAT_ID"])
 
 DB_FILE = "geziene_advertenties.json"
 URLS_FILE = "zoekopdrachten.txt"
+USERS_FILE = "gebruikers.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -63,12 +64,13 @@ def ontsleutel(inhoud, sleutel):
         return None
 
 
-def stuur_telegram(tekst, parse_mode="HTML"):
+def stuur_telegram(tekst, parse_mode="HTML", chat_id=None):
     global telegram_bereikbaar
     if not telegram_bereikbaar:
         return
 
-    payload = {"chat_id": CHAT_ID, "text": tekst, "disable_web_page_preview": False}
+    doel_chat_id = str(chat_id) if chat_id is not None else CHAT_ID
+    payload = {"chat_id": doel_chat_id, "text": tekst, "disable_web_page_preview": False}
     if parse_mode:
         payload["parse_mode"] = parse_mode
 
@@ -82,7 +84,7 @@ def stuur_telegram(tekst, parse_mode="HTML"):
             log(f"⚠️ Telegram serverfout ({resp.status_code}), overige meldingen worden overgeslagen.")
             telegram_bereikbaar = False
         elif resp.status_code == 400 and parse_mode:
-            stuur_telegram(re.sub(r"<[^>]+>", "", tekst), parse_mode=None)
+            stuur_telegram(re.sub(r"<[^>]+>", "", tekst), parse_mode=None, chat_id=doel_chat_id)
         elif not resp.ok:
             log(f"⚠️ Telegram melding geweigerd ({resp.status_code}).")
     except Exception:
@@ -349,10 +351,129 @@ def is_nieuwe_verkoper(ad_url, seller_id=None, cache=None):
     return is_nieuw
 
 
+def laad_gebruikers():
+    if not os.path.exists(USERS_FILE):
+        return {}
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            ruwe_data = json.load(f)
+        if not isinstance(ruwe_data, dict):
+            return {}
+        if isinstance(ruwe_data.get("data"), str) and ruwe_data["data"].startswith("ENC1:"):
+            ontsleuteld = ontsleutel(ruwe_data["data"], TOKEN)
+            if not ontsleuteld:
+                return {}
+            parsed = json.loads(ontsleuteld)
+        else:
+            parsed = ruwe_data
+        users = parsed.get("users") if isinstance(parsed, dict) else None
+        return users if isinstance(users, dict) else {}
+    except Exception:
+        log(f"⚠️ Kon {USERS_FILE} niet lezen, extra gebruikers worden overgeslagen.")
+        return {}
+
+
+def verwerk_gebruiker_regels(regels_lijst, user_db, doel_chat_id, label, url_cache, verkoper_cache):
+    alle_bekende_ids = {i for ids in user_db.values() for i in ids}
+    alle_bekende_nummers = [haal_id_nummer(i) for i in alle_bekende_ids]
+    globaal_hoogste_id = max(alle_bekende_nummers) if alle_bekende_nummers else 0
+
+    nieuwe_user_db = {}
+    aantal_gelukt = 0
+    aantal_mislukt = 0
+    blokkade_status = None
+    laatste_fout = ""
+
+    for idx, regel in enumerate(regels_lijst, start=1):
+        if "|" in regel and not regel.startswith("http"):
+            naam, url = [deel.strip() for deel in regel.split("|", 1)]
+        else:
+            naam, url = bedenk_naam(regel), regel
+
+        is_nieuwe_url = url not in user_db
+        geziene_ids = set(user_db.get(url, set()))
+        bestaande_nummers = [haal_id_nummer(i) for i in geziene_ids]
+        hoogste_bekende_id = max(bestaande_nummers) if bestaande_nummers else globaal_hoogste_id
+
+        log(f"Controleren ({label}): Zoekopdracht #{idx} (eerste keer: {is_nieuwe_url})")
+
+        uit_cache = url in url_cache
+        try:
+            if uit_cache:
+                advertenties = url_cache[url]
+                log(f" -> {len(advertenties)} advertenties (uit cache).")
+            else:
+                advertenties = haal_advertenties_op(url)
+                url_cache[url] = advertenties
+                log(f" -> {len(advertenties)} advertenties opgehaald.")
+            aantal_gelukt += 1
+        except Exception as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code in (403, 429):
+                blokkade_status = status_code
+            laatste_fout = f"HTTP {status_code}" if status_code else type(e).__name__
+            aantal_mislukt += 1
+            log(f" -> Fout bij ophalen van Zoekopdracht #{idx} ({laatste_fout}).")
+            if not is_nieuwe_url:
+                nieuwe_user_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
+            continue
+
+        nieuwe_ids_aantal = 0
+        gepusht_aantal = 0
+        gefilterd_aantal = 0
+
+        for ad in advertenties:
+            if ad["id"] in geziene_ids:
+                continue
+
+            geziene_ids.add(ad["id"])
+            nieuwe_ids_aantal += 1
+            ad_nummer = haal_id_nummer(ad["id"])
+
+            if is_nieuwe_url:
+                alle_bekende_ids.add(ad["id"])
+                continue
+
+            if ad["id"] in alle_bekende_ids:
+                continue
+
+            alle_bekende_ids.add(ad["id"])
+
+            if ad["datum"].lower() != "vandaag" or ad_nummer <= hoogste_bekende_id:
+                continue
+
+            if is_nieuwe_verkoper(ad["link"], ad.get("seller_id"), verkoper_cache):
+                gefilterd_aantal += 1
+                continue
+
+            gepusht_aantal += 1
+            veilige_naam = html.escape(naam)
+            veilige_titel = html.escape(ad["titel"])
+            veilige_prijs = html.escape(ad["prijs"])
+            telegram_bericht = (
+                f"🆕 <b>{veilige_naam}</b>\n"
+                f"{veilige_titel}\n"
+                f"Prijs: {veilige_prijs}\n"
+                f"<a href=\"{ad['link']}\">Bekijk advertentie</a>"
+            )
+            stuur_telegram(telegram_bericht, chat_id=doel_chat_id)
+
+        nieuwe_user_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
+        if gefilterd_aantal > 0:
+            log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd, {gefilterd_aantal} gefilterd op 0-dagen verkoper).")
+        else:
+            log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
+        if not uit_cache:
+            time.sleep(1)
+
+    return nieuwe_user_db, aantal_gelukt, aantal_mislukt, blokkade_status, laatste_fout
+
+
 log("Start Marktplaats controle...")
 
 db = {}
 oude_meta = {}
+oude_users_db = {}
 if os.path.exists(DB_FILE):
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -365,14 +486,16 @@ if os.path.exists(DB_FILE):
                         db = {k: set(v) for k, v in parsed_db.items() if isinstance(v, list)}
                         if isinstance(parsed_db.get("_meta"), dict):
                             oude_meta = parsed_db["_meta"]
+                        if isinstance(parsed_db.get("_users"), dict):
+                            oude_users_db = {
+                                str(uid): {u: set(ids) for u, ids in udb.items() if isinstance(ids, list)}
+                                for uid, udb in parsed_db["_users"].items()
+                                if isinstance(udb, dict)
+                            }
                 elif "urls" not in ruwe_data and "data" not in ruwe_data:
                     db = {k: set(v) for k, v in ruwe_data.items() if isinstance(v, list)}
     except Exception:
         log(f"⚠️ Kon {DB_FILE} niet lezen, start met lege database.")
-
-alle_bekende_ids = {i for ids in db.values() for i in ids}
-alle_bekende_nummers = [haal_id_nummer(i) for i in alle_bekende_ids]
-globaal_hoogste_id = max(alle_bekende_nummers) if alle_bekende_nummers else 0
 
 if not os.path.exists(URLS_FILE):
     with open(URLS_FILE, "w", encoding="utf-8") as f:
@@ -396,94 +519,45 @@ else:
         with open(URLS_FILE, "w", encoding="utf-8") as f:
             f.write(versleutel("\n".join(regels), TOKEN) + "\n")
 
-log(f"{len(regels)} zoekopdracht(en) gevonden.")
+extra_gebruikers = laad_gebruikers()
+actieve_extra_gebruikers = {
+    str(uid): info
+    for uid, info in extra_gebruikers.items()
+    if str(uid) != CHAT_ID and isinstance(info, dict) and info.get("zoekopdrachten")
+}
 
-nieuwe_db = {}
+totaal_zoekopdrachten = len(regels) + sum(len(u["zoekopdrachten"]) for u in actieve_extra_gebruikers.values())
+log(f"{len(regels)} zoekopdracht(en) voor eigenaar en {len(actieve_extra_gebruikers)} extra gebruiker(s) gevonden.")
+
 verkoper_cache = {}
-aantal_gelukt = 0
-aantal_mislukt = 0
-blokkade_status = None
-laatste_fout = ""
+url_cache = {}
 
-for idx, regel in enumerate(regels, start=1):
-    if "|" in regel and not regel.startswith("http"):
-        naam, url = [deel.strip() for deel in regel.split("|", 1)]
-    else:
-        naam, url = bedenk_naam(regel), regel
+nieuwe_db, totaal_gelukt, totaal_mislukt, blokkade_status, laatste_fout = verwerk_gebruiker_regels(
+    regels, db, CHAT_ID, "eigenaar", url_cache, verkoper_cache
+)
 
-    is_nieuwe_url = url not in db
-    geziene_ids = set(db.get(url, set()))
-    bestaande_nummers = [haal_id_nummer(i) for i in geziene_ids]
-    hoogste_bekende_id = max(bestaande_nummers) if bestaande_nummers else globaal_hoogste_id
-
-    log(f"Controleren: Zoekopdracht #{idx} (eerste keer: {is_nieuwe_url})")
-
-    try:
-        advertenties = haal_advertenties_op(url)
-        log(f" -> {len(advertenties)} advertenties opgehaald.")
-        aantal_gelukt += 1
-    except Exception as e:
-        status_code = getattr(getattr(e, "response", None), "status_code", None)
-        if status_code in (403, 429):
-            blokkade_status = status_code
-        laatste_fout = f"HTTP {status_code}" if status_code else type(e).__name__
-        aantal_mislukt += 1
-        log(f" -> Fout bij ophalen van Zoekopdracht #{idx} ({laatste_fout}).")
-        if not is_nieuwe_url:
-            nieuwe_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
+nieuwe_users_db = {}
+for uid, info in actieve_extra_gebruikers.items():
+    u_regels = [r.strip() for r in info.get("zoekopdrachten", []) if isinstance(r, str) and r.strip()]
+    if not u_regels:
         continue
-
-    nieuwe_ids_aantal = 0
-    gepusht_aantal = 0
-    gefilterd_aantal = 0
-
-    for ad in advertenties:
-        if ad["id"] in geziene_ids:
-            continue
-
-        geziene_ids.add(ad["id"])
-        nieuwe_ids_aantal += 1
-        ad_nummer = haal_id_nummer(ad["id"])
-
-        if is_nieuwe_url:
-            alle_bekende_ids.add(ad["id"])
-            continue
-
-        if ad["id"] in alle_bekende_ids:
-            continue
-
-        alle_bekende_ids.add(ad["id"])
-
-        if ad["datum"].lower() != "vandaag" or ad_nummer <= hoogste_bekende_id:
-            continue
-
-        if is_nieuwe_verkoper(ad["link"], ad.get("seller_id"), verkoper_cache):
-            gefilterd_aantal += 1
-            continue
-
-        gepusht_aantal += 1
-        veilige_naam = html.escape(naam)
-        veilige_titel = html.escape(ad["titel"])
-        veilige_prijs = html.escape(ad["prijs"])
-        telegram_bericht = (
-            f"🆕 <b>{veilige_naam}</b>\n"
-            f"{veilige_titel}\n"
-            f"Prijs: {veilige_prijs}\n"
-            f"<a href=\"{ad['link']}\">Bekijk advertentie</a>"
-        )
-        stuur_telegram(telegram_bericht)
-
-    nieuwe_db[url] = sorted(geziene_ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
-    if gefilterd_aantal > 0:
-        log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd, {gefilterd_aantal} gefilterd op 0-dagen verkoper).")
-    else:
-        log(f" -> {nieuwe_ids_aantal} nieuwe ID's opgeslagen ({gepusht_aantal} meldingen verstuurd).")
-    time.sleep(1)
+    u_db = oude_users_db.get(uid, {})
+    u_label = info.get("naam") or uid
+    u_nieuwe_db, u_gelukt, u_mislukt, u_blokkade, u_fout = verwerk_gebruiker_regels(
+        u_regels, u_db, uid, u_label, url_cache, verkoper_cache
+    )
+    nieuwe_users_db[uid] = u_nieuwe_db
+    totaal_gelukt += u_gelukt
+    totaal_mislukt += u_mislukt
+    if u_blokkade is not None:
+        blokkade_status = u_blokkade
+    if u_fout:
+        laatste_fout = u_fout
 
 nu = int(time.time())
 nieuw_meta = dict(oude_meta)
 
-if regels and aantal_mislukt > 0 and (blokkade_status is not None or aantal_gelukt == 0):
+if totaal_zoekopdrachten > 0 and totaal_mislukt > 0 and (blokkade_status is not None or totaal_gelukt == 0):
     fouten_op_rij = int(nieuw_meta.get("fouten_op_rij", 0)) + 1
     nieuw_meta["fouten_op_rij"] = fouten_op_rij
     laatste_alert = int(nieuw_meta.get("laatste_fout_alert", 0))
@@ -496,10 +570,10 @@ if regels and aantal_mislukt > 0 and (blokkade_status is not None or aantal_gelu
         stuur_telegram(
             f"⚠️ <b>Marktplaats Alert waarschuwing</b>\n"
             f"{html.escape(reden)}\n"
-            f"{aantal_mislukt} van de {len(regels)} zoekopdracht(en) mislukt."
+            f"{totaal_mislukt} van de {totaal_zoekopdrachten} zoekopdracht(en) mislukt."
         )
         nieuw_meta["laatste_fout_alert"] = nu
-elif aantal_gelukt > 0 and blokkade_status is None:
+elif totaal_gelukt > 0 and blokkade_status is None:
     nieuw_meta.pop("fouten_op_rij", None)
     if nu - int(nieuw_meta.get("laatste_fout_alert", 0)) > 24 * 3600:
         nieuw_meta.pop("laatste_fout_alert", None)
@@ -508,12 +582,23 @@ oude_db_genormaliseerd = {
     k: sorted(v, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
     for k, v in db.items()
 }
+oude_users_genormaliseerd = {
+    uid: {
+        u: sorted(ids, key=haal_id_nummer)[-MAX_OPGESLAGEN_IDS:]
+        for u, ids in udb.items()
+    }
+    for uid, udb in oude_users_db.items()
+}
 
 oude_payload = {**oude_db_genormaliseerd}
+if oude_users_genormaliseerd:
+    oude_payload["_users"] = oude_users_genormaliseerd
 if oude_meta:
     oude_payload["_meta"] = oude_meta
 
 nieuwe_payload = {**nieuwe_db}
+if nieuwe_users_db:
+    nieuwe_payload["_users"] = nieuwe_users_db
 if nieuw_meta:
     nieuwe_payload["_meta"] = nieuw_meta
 
